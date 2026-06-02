@@ -20,26 +20,16 @@ Catches: injection, XSS, hardcoded secrets, insecure crypto, path traversal, pro
 ## Requirements
 
 - Node.js ≥ 18
-- [Semgrep](https://semgrep.dev/docs/getting-started/) (`pip install semgrep` or `brew install semgrep`)
-- `ANTHROPIC_API_KEY` — only needed for the conversational agent interface
+- `ANTHROPIC_API_KEY` — only needed for the conversational agent (`argus-ci chat`)
 
----
-
-## Install
-
-```bash
-npm install -g argus-ci
-# or use without installing:
-npx argus-ci
-```
+> **Semgrep is installed automatically** by `npx argus-ci setup`. No manual install needed.
 
 ---
 
 ## 1. Add to your AI editor (MCP)
 
-This is the main use case. Once added, your AI agent will automatically scan every file it writes.
+Open **Cursor Settings → MCP** and add:
 
-**Cursor** — Settings → MCP → add:
 ```json
 {
   "argus-ci": {
@@ -61,13 +51,7 @@ This is the main use case. Once added, your AI agent will automatically scan eve
 }
 ```
 
-Then copy `CLAUDE.md` (or `.cursorrules`) from this package into your repo root. The AI agent will automatically call `scan_files` after every code generation.
-
-```bash
-# Copy the trigger instructions into your repo
-cp node_modules/argus-ci/CLAUDE.md ./CLAUDE.md
-cp node_modules/argus-ci/.cursorrules ./.cursorrules
-```
+The MCP server registers as **"argus"** in Cursor's tool panel.
 
 ### MCP tools available
 
@@ -80,9 +64,9 @@ cp node_modules/argus-ci/.cursorrules ./.cursorrules
 
 ---
 
-## 2. Pre-commit hook (mandatory gate)
+## 2. Run setup in your repo
 
-Installs a git hook that runs on every `git commit`. Errors block the commit. Warnings pass through.
+One command does everything — installs Semgrep, copies AI trigger files, and installs the pre-commit hook.
 
 ```bash
 cd your-repo
@@ -91,92 +75,61 @@ npx argus-ci setup
 
 Output:
 ```
-✅ argus-ci pre-commit hook installed.
-   Using semgrep 1.x.x
+🚀 argus-ci setup
 
-The hook will:
-  • Run on every git commit automatically
-  • Scan only the files you're committing (fast)
-  • Block the commit if any ERROR-severity issues are found
-  • Allow commits with only warnings
+  ⚙️  Semgrep not found — installing automatically...
+     → brew install semgrep
+  ✓ Semgrep installed (semgrep 1.x.x)
+  ✓ CLAUDE.md written
+  ✓ .cursorrules written
+  ✓ Pre-commit hook installed
 
-To remove:  argus-ci setup --remove
-To bypass:  git commit --no-verify  (emergency only)
+✅ Setup complete. argus-ci is now active in this repo.
+
+  What happens next:
+  • Every file your AI agent writes is scanned automatically (via MCP)
+  • Every commit is scanned — errors block the commit
+  • CLAUDE.md and .cursorrules tell your AI agent to run scans automatically
+
+  To review a PR:     npx argus-ci pr <github-url>
+  To remove the hook: npx argus-ci setup --remove
 ```
+
+The setup does three things automatically:
+- **Semgrep** — installed via Homebrew on macOS, pip3 elsewhere. Skipped if already installed.
+- **CLAUDE.md / .cursorrules** — copied into the repo root. Tell the AI agent to call `scan_files` after every code generation.
+- **Pre-commit hook** — written to `.git/hooks/pre-commit`. Blocks commits with ERROR-severity findings.
+
+To remove: `npx argus-ci setup --remove`  
+Emergency bypass: `git commit --no-verify` (not recommended)
 
 ---
 
 ## 3. Conversational agent
 
-Review a PR or branch in plain English:
+Review a PR or branch in plain English. Requires `ANTHROPIC_API_KEY`.
 
-```bash
-# Interactive REPL
-argus-ci chat
-
-# One-shot
-argus-ci chat "review PR https://github.com/org/repo/pull/142"
-argus-ci pr https://github.com/org/repo/pull/142
-argus-ci scan --branch feature/auth
-```
-
-Requires `ANTHROPIC_API_KEY`:
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
+
+# One-shot PR review
+argus-ci pr https://github.com/org/repo/pull/142
+
+# Interactive REPL
 argus-ci chat
-```
-
-Example session:
-```
-You: review PR https://github.com/org/repo/pull/87
-
-⚙️  Running scan_pr...
-
-## Semgrep scan — PR #87: Add user authentication
-
-| Severity | Count |
-|----------|-------|
-| 🔴 Error   | 2     |
-| 🟡 Warning | 1     |
-
-### `src/auth/login.ts`
-
-**🔴 ERROR** — Line 34
-> Timing attack: comparing secrets with === allows attackers to measure
-> response time and guess tokens byte by byte.
-`if (token === storedToken) {`
-_Rule: `javascript.lang.security.audit.timing-attack`_
-_CWE: CWE-208_
-
-**Fix:** Use `crypto.timingSafeEqual(Buffer.from(token), Buffer.from(storedToken))`
+# You: review PR https://github.com/org/repo/pull/142
+# You: check branch feature/payments
+# You: what issues are in my current changes
 ```
 
 ---
 
-## 4. CLI scan
-
-```bash
-# Scan staged files (same as what the pre-commit hook runs)
-argus-ci scan
-
-# Scan specific files
-argus-ci scan src/auth/login.ts src/api/users.ts
-
-# Scan a branch vs main
-argus-ci scan --branch feature/payments
-
-# Version
-argus-ci --version
-```
-
----
-
-## 5. GitHub Actions (CI gate)
+## 4. GitHub Actions (CI gate)
 
 Add to `.github/workflows/argus-ci.yml`:
 
 ```yaml
-name: Code Patrol
+name: argus-ci security scan
 
 on:
   pull_request:
@@ -207,11 +160,7 @@ jobs:
 
 ## Rulesets
 
-Auto-detected from your project. Override in any scan:
-
-```bash
-argus-ci scan --config '{"rulesets":["p/secrets","p/owasp-top-ten","p/nodejs"]}'
-```
+Auto-detected from your project. No config needed.
 
 | Ruleset | When used |
 |---------|-----------|
@@ -239,4 +188,4 @@ argus-ci scan --config '{"rulesets":["p/secrets","p/owasp-top-ten","p/nodejs"]}'
 
 ## License
 
-MIT © [Venkat Swara Moyya](https://github.com/venkatswaramoyya)
+MIT © [Venkat Swara Moyya](https://github.com/Naidu2404)
