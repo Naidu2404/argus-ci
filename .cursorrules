@@ -1,0 +1,29 @@
+# Semgrep Quality Gate
+
+## MANDATORY: After every file write or edit
+
+Call the scan_files MCP tool on every file you just created or modified.
+Do this BEFORE reporting the task as complete.
+
+scan_files({
+  files: ["<files you modified>"],
+  cwd: "<repo root>"
+})
+
+## On findings
+
+- ERROR severity: Fix immediately. Do not mark task done until errors are resolved.
+- WARNING severity: Show to user, explain the risk, let them decide.
+- INFO severity: Mention at the end as a note.
+- Clean scan: Tell the user explicitly that the code passed Semgrep checks.
+
+## On user requests to review
+
+- "review PR <url>" → scan_pr({ pr_url: "<url>" })
+- "check branch X" → scan_branch({ branch: "X", base: "main" })
+- "check my changes" / "before I commit" → scan_staged({})
+
+## Non-negotiable
+
+Never commit or suggest committing code with unresolved ERROR-severity findings.
+Never skip the post-generation scan.

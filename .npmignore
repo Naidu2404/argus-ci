@@ -1,0 +1,6 @@
+src/
+tsconfig.json
+*.ts
+!bin/
+.env*
+.gitignore
