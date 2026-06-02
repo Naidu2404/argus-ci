@@ -29,15 +29,15 @@
     "agent",
     "ai"
   ],
-  "author": "Venkat Swara Moyya <venkatswaramoyya@recruitcrm.io>",
+  "author": "Venkat Swara Moyya <Naidu2404@recruitcrm.io>",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/venkatswaramoyya/argus-ci.git"
+    "url": "https://github.com/Naidu2404/argus-ci.git"
   },
-  "homepage": "https://github.com/venkatswaramoyya/argus-ci#readme",
+  "homepage": "https://github.com/Naidu2404/argus-ci#readme",
   "bugs": {
-    "url": "https://github.com/venkatswaramoyya/argus-ci/issues"
+    "url": "https://github.com/Naidu2404/argus-ci/issues"
   },
   "engines": {
     "node": ">=18.0.0"
