@@ -30,7 +30,7 @@ ${HOOK_MARKER}
 # Remove with: npx argus-ci setup --remove
 # Bypass (emergency only): git commit --no-verify
 
-echo "🔍 argus-ci: scanning staged files..."
+echo "🔍 argus-ci: scanning staged files (Opengrep + Bearer if installed)..."
 
 npx --yes argus-ci scan --staged
 EXIT_CODE=$?
@@ -60,8 +60,11 @@ export async function setupHook(cwd: string): Promise<void> {
 
   console.log("\n🚀 argus-ci setup\n");
 
-  // Step 1: ensure Semgrep is installed
-  await ensureSemgrep();
+  // Step 1: ensure Opengrep (or Semgrep fallback) is installed
+  await ensurePrimaryScanner();
+
+  // Step 2: offer Bearer for deep data-flow scanning
+  await ensureBearer();
 
   // Step 2: copy trigger files into the repo
   copyTriggerFiles(cwd);
@@ -73,8 +76,8 @@ export async function setupHook(cwd: string): Promise<void> {
 ✅ Setup complete. argus-ci is now active in this repo.
 
   What happens next:
-  • Every file your AI agent writes is scanned automatically (via MCP)
-  • Every commit is scanned — errors block the commit
+  • Every file your AI agent writes is scanned (Opengrep — fast, taint-aware)
+  • Every commit is scanned (Opengrep + Bearer if installed) — errors block the commit
   • CLAUDE.md and .cursorrules tell your AI agent to run scans automatically
 
   To review a PR:     npx argus-ci pr <github-url>
@@ -82,68 +85,128 @@ export async function setupHook(cwd: string): Promise<void> {
 `);
 }
 
-// ─── Step 1: auto-install Semgrep ────────────────────────────────────────────
+// ─── Step 1: auto-install Opengrep (or Semgrep fallback) ─────────────────────
 
-async function ensureSemgrep(): Promise<void> {
-  if (isSemgrepInstalled()) {
-    const v = getSemgrepVersion();
-    console.log(`  ✓ Semgrep already installed (${v})`);
+async function ensurePrimaryScanner(): Promise<void> {
+  // Check if opengrep is already installed
+  if (isScannerInstalled("opengrep")) {
+    const v = getScannerVersion("opengrep");
+    console.log(`  ✓ Opengrep already installed (${v})`);
     return;
   }
 
-  console.log("  ⚙️  Semgrep not found — installing automatically...");
-
-  const os = platform();
-  let installed = false;
-
-  if (os === "darwin") {
-    // Try Homebrew first on macOS
-    if (commandExists("brew")) {
-      console.log("     → brew install semgrep");
-      const r = spawnSync("brew", ["install", "semgrep"], { stdio: "inherit" });
-      installed = r.status === 0;
-    }
+  // Check if semgrep is installed as fallback
+  if (isScannerInstalled("semgrep")) {
+    const v = getScannerVersion("semgrep");
+    console.log(`  ✓ Semgrep installed (${v}) — Opengrep not found, using Semgrep as fallback`);
+    console.log(`    Note: Install Opengrep for free taint analysis: pip install opengrep`);
+    return;
   }
+
+  // Neither found — try to install Opengrep
+  console.log("  ⚙️  No scanner found — installing Opengrep (free taint analysis)...");
+  const installed = tryInstallOpengrep();
 
   if (!installed) {
-    // Fallback: pip3 / pip (works on macOS, Linux, Windows)
-    const pipCmd = commandExists("pip3") ? "pip3" : "pip";
-    console.log(`     → ${pipCmd} install semgrep`);
-    const r = spawnSync(pipCmd, ["install", "semgrep"], { stdio: "inherit" });
-    installed = r.status === 0;
-  }
+    // Opengrep failed — try Semgrep as fallback
+    console.log("  ⚙️  Opengrep install failed — trying Semgrep as fallback...");
+    const semgrepInstalled = tryInstallSemgrep();
 
-  if (!installed || !isSemgrepInstalled()) {
-    console.error(`
-  ❌ Could not install Semgrep automatically.
-     Please install it manually then re-run setup:
+    if (!semgrepInstalled) {
+      console.error(`
+  ❌ Could not install a scanner automatically.
+     Please install one manually then re-run setup:
 
-       brew install semgrep   (macOS)
-       pip install semgrep    (any platform)
+       pip install opengrep    (recommended — free taint analysis)
+       brew install semgrep    (macOS, fallback)
+       pip install semgrep     (any platform, fallback)
 `);
-    process.exit(1);
+      process.exit(1);
+    }
+    const v = getScannerVersion("semgrep");
+    console.log(`  ✓ Semgrep installed as fallback (${v})`);
+    return;
   }
 
-  const v = getSemgrepVersion();
-  console.log(`  ✓ Semgrep installed (${v})`);
+  const v = getScannerVersion("opengrep");
+  console.log(`  ✓ Opengrep installed (${v}) — taint analysis enabled`);
 }
 
-function isSemgrepInstalled(): boolean {
-  const candidates = ["semgrep", "/usr/local/bin/semgrep", "/opt/homebrew/bin/semgrep"];
-  for (const cmd of candidates) {
+function tryInstallOpengrep(): boolean {
+  const pipCmd = commandExists("pip3") ? "pip3" : "pip";
+  console.log(`     → ${pipCmd} install opengrep`);
+  const r = spawnSync(pipCmd, ["install", "opengrep"], { stdio: "inherit" });
+  return r.status === 0 && isScannerInstalled("opengrep");
+}
+
+function tryInstallSemgrep(): boolean {
+  const os = platform();
+  if (os === "darwin" && commandExists("brew")) {
+    console.log("     → brew install semgrep");
+    const r = spawnSync("brew", ["install", "semgrep"], { stdio: "inherit" });
+    if (r.status === 0) return true;
+  }
+  const pipCmd = commandExists("pip3") ? "pip3" : "pip";
+  console.log(`     → ${pipCmd} install semgrep`);
+  const r = spawnSync(pipCmd, ["install", "semgrep"], { stdio: "inherit" });
+  return r.status === 0 && isScannerInstalled("semgrep");
+}
+
+function isScannerInstalled(scanner: "opengrep" | "semgrep"): boolean {
+  for (const cmd of [scanner, `/usr/local/bin/${scanner}`, `/opt/homebrew/bin/${scanner}`]) {
     const r = spawnSync(cmd, ["--version"], { encoding: "utf8" });
     if (r.status === 0) return true;
   }
-  // Try python module form
-  const r = spawnSync("python3", ["-m", "semgrep", "--version"], { encoding: "utf8" });
+  const r = spawnSync("python3", ["-m", scanner, "--version"], { encoding: "utf8" });
   return r.status === 0;
 }
 
-function getSemgrepVersion(): string {
-  const r = spawnSync("semgrep", ["--version"], { encoding: "utf8" });
+function getScannerVersion(scanner: "opengrep" | "semgrep"): string {
+  const r = spawnSync(scanner, ["--version"], { encoding: "utf8" });
   if (r.status === 0) return r.stdout.trim().split("\n")[0];
-  const r2 = spawnSync("python3", ["-m", "semgrep", "--version"], { encoding: "utf8" });
+  const r2 = spawnSync("python3", ["-m", scanner, "--version"], { encoding: "utf8" });
   return r2.stdout?.trim().split("\n")[0] ?? "unknown";
+}
+
+// ─── Step 1b: offer Bearer install ───────────────────────────────────────────
+
+async function ensureBearer(): Promise<void> {
+  // Check if Bearer already installed
+  for (const cmd of ["bearer", "/usr/local/bin/bearer", "/opt/homebrew/bin/bearer"]) {
+    const r = spawnSync(cmd, ["version"], { encoding: "utf8" });
+    if (r.status === 0) {
+      console.log(`  ✓ Bearer already installed — deep data-flow analysis enabled`);
+      return;
+    }
+  }
+
+  // Try to install Bearer
+  console.log("  ⚙️  Installing Bearer (deep data-flow analysis)...");
+  const os = platform();
+  let installed = false;
+
+  if (os === "darwin" && commandExists("brew")) {
+    console.log("     → brew install bearer/tap/bearer");
+    const r = spawnSync("brew", ["install", "bearer/tap/bearer"], { stdio: "inherit" });
+    installed = r.status === 0;
+  }
+
+  if (!installed) {
+    // Try the install script (macOS/Linux)
+    console.log("     → curl install script");
+    const r = spawnSync(
+      "sh", ["-c", "curl -sfL https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh | sh"],
+      { stdio: "inherit" }
+    );
+    installed = r.status === 0;
+  }
+
+  if (installed) {
+    console.log("  ✓ Bearer installed — staged/branch/PR scans will include data-flow analysis");
+  } else {
+    console.log("  ℹ️  Bearer not installed (optional) — skipping data-flow analysis");
+    console.log("     Install manually: brew install bearer/tap/bearer");
+  }
 }
 
 function commandExists(cmd: string): boolean {

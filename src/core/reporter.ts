@@ -34,11 +34,13 @@ export function toMarkdown(result: ScanResult, context?: string): string {
 
   // Summary bar
   if (issues.length === 0) {
+    const engineStr = result.engines.length ? ` · engines: ${result.engines.join(" + ")}` : "";
     lines.push(`✅ **No issues found** — ${filesScanned} file${filesScanned !== 1 ? "s" : ""} scanned in ${durationMs}ms`);
-    lines.push(`\n_Rulesets: ${rulesets.join(", ")}_`);
+    lines.push(`\n_Rulesets: ${rulesets.join(", ")}${engineStr}_`);
     return lines.join("\n");
   }
 
+  const engineStr = result.engines.length ? ` · engines: ${result.engines.join(" + ")}` : "";
   lines.push(
     `| Severity | Count |`,
     `|----------|-------|`,
@@ -46,7 +48,7 @@ export function toMarkdown(result: ScanResult, context?: string): string {
     `| 🟡 Warning | ${warnings.length} |`,
     `| 🔵 Info    | ${infos.length}    |`,
     ``,
-    `_${filesScanned} file${filesScanned !== 1 ? "s" : ""} scanned · ${durationMs}ms · rulesets: ${rulesets.join(", ")}_`,
+    `_${filesScanned} file${filesScanned !== 1 ? "s" : ""} scanned · ${durationMs}ms · rulesets: ${rulesets.join(", ")}${engineStr}_`,
     ``
   );
 
@@ -62,7 +64,7 @@ export function toMarkdown(result: ScanResult, context?: string): string {
       if (issue.sourceLine) {
         lines.push(`\`\`\`\n${issue.sourceLine}\n\`\`\``);
       }
-      lines.push(`_Rule: \`${issue.ruleId}\`_`);
+      lines.push(`_Rule: \`${issue.ruleId}\` · via ${issue.engine}_`);
       if (issue.cwe?.length)   lines.push(`_CWE: ${issue.cwe.join(", ")}_`);
       if (issue.owasp?.length) lines.push(`_OWASP: ${issue.owasp.join(", ")}_`);
     }
