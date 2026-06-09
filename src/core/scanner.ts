@@ -1,11 +1,10 @@
 /**
- * Scanner core — runs Opengrep (primary) or Semgrep (fallback) for pattern-based
- * security analysis, then optionally runs Bearer for deep data-flow analysis.
+ * Scanner core — three-pass analysis:
  *
- * Scanner priority:
- *   1. opengrep  — free taint analysis, drop-in Semgrep replacement
- *   2. semgrep   — fallback if opengrep not installed
- *   3. bearer    — optional second pass, deep data-flow, run on staged/branch/PR
+ *   1. Opengrep / Semgrep  — security patterns + OWASP + secrets (always)
+ *   2. Bearer              — deep data-flow security (staged/branch/PR)
+ *   3. Quality engine      — language-specific linter: Oxlint / Ruff /
+ *                            golangci-lint / RuboCop / PMD (staged/branch/PR)
  */
 
 import { execSync, spawnSync } from "child_process";
@@ -17,6 +16,8 @@ import type {
   SemgrepFinding, SemgrepRawResult,
   BearerRawResult, BearerFinding,
 } from "../types.js";
+import { detectRulesets } from "./detector.js";
+import { runQualityScan, isQualityEngineInstalled } from "./quality.js";
 
 const DEFAULT_RULESETS = ["p/secrets", "p/owasp-top-ten", "p/security-audit"];
 const DEFAULT_EXCLUDE  = ["node_modules", "dist", ".git", "coverage", "build", ".next", "vendor"];
@@ -35,17 +36,29 @@ export async function scanFiles(
     return empty("No eligible files to scan", t0, config);
   }
 
-  // Run Opengrep/Semgrep
+  // Pass 1: Opengrep / Semgrep — security patterns (always)
   const primaryResult = await runPrimaryScanner(eligible, cwd, config, t0);
 
-  // Bearer: optional, skip for single-file MCP calls (too slow)
-  const runBearer = config.runBearer ?? (eligible.length > 1);
+  // Pass 2: Bearer — deep data-flow security (skip for single-file MCP calls)
+  const runBearer  = config.runBearer  ?? (eligible.length > 1);
+  // Pass 3: Quality linter — code quality (skip for single-file MCP calls)
+  const runQuality = config.runQuality ?? (eligible.length > 1);
+
+  const results: ScanResult[] = [primaryResult];
+
   if (runBearer && isBearerInstalled()) {
-    const bearerResult = await runBearerScan(eligible, cwd, t0);
-    return mergeResults(primaryResult, bearerResult, t0);
+    results.push(await runBearerScan(eligible, cwd, t0));
   }
 
-  return primaryResult;
+  if (runQuality) {
+    const stackInfo   = detectRulesets(cwd);
+    const engine      = config.qualityEngine ?? stackInfo.qualityEngine;
+    if (engine && isQualityEngineInstalled(engine)) {
+      results.push(await runQualityScan(eligible, cwd, engine, t0));
+    }
+  }
+
+  return results.length === 1 ? results[0]! : mergeAll(results, t0);
 }
 
 export async function scanStaged(cwd: string, config: ScanConfig = {}): Promise<ScanResult> {
@@ -61,8 +74,12 @@ export async function scanStaged(cwd: string, config: ScanConfig = {}): Promise<
     return empty("No staged files", Date.now(), config);
   }
 
-  // Always run Bearer on staged files (this is the pre-commit gate — worth the extra seconds)
-  return scanFiles(staged, cwd, { ...config, runBearer: config.runBearer ?? true });
+  // Pre-commit gate: run Bearer + quality linter (worth the extra seconds)
+  return scanFiles(staged, cwd, {
+    ...config,
+    runBearer:  config.runBearer  ?? true,
+    runQuality: config.runQuality ?? true,
+  });
 }
 
 export async function scanBranch(
@@ -94,7 +111,11 @@ export async function scanBranch(
     return empty(`No changed files between ${base} and ${branch}`, Date.now(), config);
   }
 
-  return scanFiles(files, cwd, { ...config, runBearer: config.runBearer ?? true });
+  return scanFiles(files, cwd, {
+    ...config,
+    runBearer:  config.runBearer  ?? true,
+    runQuality: config.runQuality ?? true,
+  });
 }
 
 // ─── Primary scanner (Opengrep / Semgrep) ────────────────────────────────────
@@ -246,24 +267,29 @@ async function runBearerScan(
 
 // ─── Merge results ────────────────────────────────────────────────────────────
 
-function mergeResults(primary: ScanResult, bearer: ScanResult, t0: number): ScanResult {
-  const allIssues = [...primary.issues, ...bearer.issues];
-  // Deduplicate: same file + same line from both scanners
-  const seen = new Set<string>();
-  const deduped = allIssues.filter((i) => {
-    const key = `${i.path}:${i.line}:${i.ruleId}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+/** Merge any number of ScanResults, deduplicating by path:line:ruleId */
+function mergeAll(results: ScanResult[], t0: number): ScanResult {
+  const seen    = new Set<string>();
+  const deduped: Issue[] = [];
 
+  for (const r of results) {
+    for (const issue of r.issues) {
+      const key = `${issue.path}:${issue.line}:${issue.ruleId}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        deduped.push(issue);
+      }
+    }
+  }
+
+  const primary = results[0]!;
   return {
     issues:       deduped,
-    skipped:      primary.skipped && bearer.skipped,
+    skipped:      results.every((r) => r.skipped),
     filesScanned: primary.filesScanned,
     durationMs:   Date.now() - t0,
-    rulesets:     [...new Set([...primary.rulesets, ...bearer.rulesets])],
-    engines:      [...new Set([...primary.engines, ...bearer.engines])],
+    rulesets:     [...new Set(results.flatMap((r) => r.rulesets))],
+    engines:      [...new Set(results.flatMap((r) => r.engines))],
   };
 }
 

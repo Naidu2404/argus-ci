@@ -15,6 +15,8 @@ import { join, dirname } from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { platform, homedir } from "os";
+import { detectRulesets } from "../core/detector.js";
+import type { QualityEngine } from "../types.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = dirname(__filename);
@@ -60,24 +62,35 @@ export async function setupHook(cwd: string): Promise<void> {
 
   console.log("\n🚀 argus-ci setup\n");
 
+  // Detect stack upfront so we can show what we're setting up
+  const stackInfo = detectRulesets(cwd);
+  console.log(`  Detected stack: ${stackInfo.stack.join(", ")}\n`);
+
   // Step 1: ensure Opengrep (or Semgrep fallback) is installed
   await ensurePrimaryScanner();
 
-  // Step 2: offer Bearer for deep data-flow scanning
+  // Step 2: Bearer for deep data-flow security analysis
   await ensureBearer();
 
-  // Step 2: copy trigger files into the repo
+  // Step 3: language-specific quality linter
+  await ensureQualityEngine(stackInfo.qualityEngine);
+
+  // Step 4: copy trigger files into the repo
   copyTriggerFiles(cwd);
 
-  // Step 3: install the pre-commit hook
+  // Step 5: install the pre-commit hook
   installPreCommitHook(cwd);
+
+  const qualityNote = stackInfo.qualityEngine
+    ? `Opengrep + Bearer + ${stackInfo.qualityEngine}`
+    : "Opengrep + Bearer";
 
   console.log(`
 ✅ Setup complete. argus-ci is now active in this repo.
 
   What happens next:
   • Every file your AI agent writes is scanned (Opengrep — fast, taint-aware)
-  • Every commit is scanned (Opengrep + Bearer if installed) — errors block the commit
+  • Every commit is scanned (${qualityNote}) — errors block the commit
   • CLAUDE.md and .cursorrules tell your AI agent to run scans automatically
 
   To review a PR:     npx argus-ci pr <github-url>
@@ -264,7 +277,152 @@ function commandExists(cmd: string): boolean {
   return r.status === 0;
 }
 
-// ─── Step 2: copy trigger files ───────────────────────────────────────────────
+// ─── Step 3: auto-install language quality linter ────────────────────────────
+
+async function ensureQualityEngine(engine: QualityEngine | null): Promise<void> {
+  if (!engine) {
+    console.log("  ℹ️  No quality linter for this stack — skipping");
+    return;
+  }
+
+  const label = QUALITY_ENGINE_LABELS[engine];
+
+  // Check if already installed
+  if (isQualityEnginePresent(engine)) {
+    console.log(`  ✓ ${label} already installed — code quality analysis enabled`);
+    return;
+  }
+
+  console.log(`  ⚙️  Installing ${label} (code quality linter)...`);
+  const installed = tryInstallQualityEngine(engine);
+
+  if (installed) {
+    console.log(`  ✓ ${label} installed — commits will include quality checks`);
+  } else {
+    console.log(`  ℹ️  ${label} not installed (optional) — quality checks skipped`);
+    console.log(`     Install manually: ${QUALITY_ENGINE_INSTALL_HINT[engine]}`);
+  }
+}
+
+const QUALITY_ENGINE_LABELS: Record<QualityEngine, string> = {
+  "oxlint":        "Oxlint (JS/TS quality)",
+  "ruff":          "Ruff (Python quality)",
+  "golangci-lint": "golangci-lint (Go quality)",
+  "rubocop":       "RuboCop (Ruby quality)",
+  "pmd":           "PMD (Java quality)",
+};
+
+const QUALITY_ENGINE_INSTALL_HINT: Record<QualityEngine, string> = {
+  "oxlint":        "npm install -g oxlint",
+  "ruff":          "pip install ruff  OR  brew install ruff",
+  "golangci-lint": "brew install golangci-lint  OR  curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh",
+  "rubocop":       "gem install rubocop",
+  "pmd":           "brew install pmd",
+};
+
+function isQualityEnginePresent(engine: QualityEngine): boolean {
+  const candidates = qualityEngineCandidates(engine);
+  const versionArg = engine === "golangci-lint" ? "--version" : "--version";
+  for (const cmd of candidates) {
+    const r = spawnSync(cmd, [versionArg], { encoding: "utf8" });
+    if (r.status === 0) return true;
+  }
+  return false;
+}
+
+function qualityEngineCandidates(engine: QualityEngine): string[] {
+  const home = homedir();
+  switch (engine) {
+    case "oxlint":
+      return ["oxlint", "/usr/local/bin/oxlint", "/opt/homebrew/bin/oxlint",
+              join(home, ".local", "bin", "oxlint"), join(home, ".npm-global", "bin", "oxlint")];
+    case "ruff":
+      return ["ruff", "/usr/local/bin/ruff", "/opt/homebrew/bin/ruff",
+              join(home, ".local", "bin", "ruff"), join(home, ".cargo", "bin", "ruff")];
+    case "golangci-lint":
+      return ["golangci-lint", "/usr/local/bin/golangci-lint", "/opt/homebrew/bin/golangci-lint",
+              join(home, "go", "bin", "golangci-lint")];
+    case "rubocop":
+      return ["rubocop", "/usr/local/bin/rubocop", join(home, ".rbenv", "shims", "rubocop")];
+    case "pmd":
+      return ["pmd", "/usr/local/bin/pmd", "/opt/homebrew/bin/pmd"];
+  }
+}
+
+function tryInstallQualityEngine(engine: QualityEngine): boolean {
+  const os = platform();
+
+  switch (engine) {
+    case "oxlint": {
+      // npm install -g oxlint (works on any OS with Node)
+      if (commandExists("npm")) {
+        console.log("     → npm install -g oxlint");
+        const r = spawnSync("npm", ["install", "-g", "oxlint"], { stdio: "inherit" });
+        if (r.status === 0 && isQualityEnginePresent("oxlint")) return true;
+      }
+      // npx as fallback — oxlint can run via npx without global install
+      console.log("     ℹ️  Will run via npx oxlint (no global install needed)");
+      return false; // npx handled at runtime in quality.ts
+    }
+
+    case "ruff": {
+      // brew on macOS (fastest)
+      if (os === "darwin" && commandExists("brew")) {
+        console.log("     → brew install ruff");
+        const r = spawnSync("brew", ["install", "ruff"], { stdio: "inherit" });
+        if (r.status === 0 && isQualityEnginePresent("ruff")) return true;
+      }
+      // pip with --break-system-packages
+      const pipCmd = commandExists("pip3") ? "pip3" : "pip";
+      console.log(`     → ${pipCmd} install ruff --break-system-packages`);
+      const r2 = spawnSync(pipCmd, ["install", "ruff", "--break-system-packages"], { stdio: "inherit" });
+      if (r2.status === 0 && isQualityEnginePresent("ruff")) return true;
+      // pipx fallback
+      if (commandExists("pipx")) {
+        const r3 = spawnSync("pipx", ["install", "ruff"], { stdio: "inherit" });
+        if (r3.status === 0 && isQualityEnginePresent("ruff")) return true;
+      }
+      return false;
+    }
+
+    case "golangci-lint": {
+      if (os === "darwin" && commandExists("brew")) {
+        console.log("     → brew install golangci-lint");
+        const r = spawnSync("brew", ["install", "golangci-lint"], { stdio: "inherit" });
+        if (r.status === 0) return true;
+      }
+      if (commandExists("curl")) {
+        console.log("     → curl install script");
+        const r = spawnSync(
+          "sh", ["-c", "curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $(go env GOPATH)/bin"],
+          { stdio: "inherit" }
+        );
+        if (r.status === 0 && isQualityEnginePresent("golangci-lint")) return true;
+      }
+      return false;
+    }
+
+    case "rubocop": {
+      if (commandExists("gem")) {
+        console.log("     → gem install rubocop");
+        const r = spawnSync("gem", ["install", "rubocop"], { stdio: "inherit" });
+        if (r.status === 0 && isQualityEnginePresent("rubocop")) return true;
+      }
+      return false;
+    }
+
+    case "pmd": {
+      if (os === "darwin" && commandExists("brew")) {
+        console.log("     → brew install pmd");
+        const r = spawnSync("brew", ["install", "pmd"], { stdio: "inherit" });
+        if (r.status === 0 && isQualityEnginePresent("pmd")) return true;
+      }
+      return false;
+    }
+  }
+}
+
+// ─── Step 4: copy trigger files ───────────────────────────────────────────────
 
 function copyTriggerFiles(cwd: string): void {
   const files = [

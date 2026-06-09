@@ -58,7 +58,14 @@ export interface BearerFinding {
 // ─── Normalised issue ─────────────────────────────────────────────────────────
 
 export type Severity = "error" | "warning" | "info";
-export type ScanEngine = "opengrep" | "semgrep" | "bearer";
+
+/** Security scanners */
+export type SecurityEngine = "opengrep" | "semgrep" | "bearer";
+
+/** Code quality linters — one per language ecosystem */
+export type QualityEngine = "oxlint" | "ruff" | "golangci-lint" | "rubocop" | "pmd";
+
+export type ScanEngine = SecurityEngine | QualityEngine;
 
 export interface Issue {
   ruleId:      string;
@@ -97,6 +104,10 @@ export interface ScanConfig {
   anthropicKey?:  string;
   /** Run Bearer deep scan in addition to Opengrep (default: true for staged/branch/PR, false for single file) */
   runBearer?:     boolean;
+  /** Run the language-specific quality linter (Oxlint/Ruff/golangci-lint/etc.) — default: same as runBearer */
+  runQuality?:    boolean;
+  /** Override which quality engine to use (auto-detected from stack if omitted) */
+  qualityEngine?: QualityEngine;
 }
 
 // ─── Agent tool response ──────────────────────────────────────────────────────

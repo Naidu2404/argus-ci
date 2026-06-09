@@ -1,6 +1,6 @@
 {
   "name": "argus-ci",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "description": "AI-powered code security agent — MCP server for Cursor/Claude, mandatory pre-commit gate, and conversational PR/branch review",
   "type": "module",
   "main": "dist/mcp/server.js",
@@ -29,15 +29,15 @@
     "agent",
     "ai"
   ],
-  "author": "Venkat Swara Moyya <Naidu2404@recruitcrm.io>",
+  "author": "Venkat Swara Moyya <venkatswaramoyya@recruitcrm.io>",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Naidu2404/argus-ci.git"
+    "url": "https://github.com/venkatswaramoyya/argus-ci.git"
   },
-  "homepage": "https://github.com/Naidu2404/argus-ci#readme",
+  "homepage": "https://github.com/venkatswaramoyya/argus-ci#readme",
   "bugs": {
-    "url": "https://github.com/Naidu2404/argus-ci/issues"
+    "url": "https://github.com/venkatswaramoyya/argus-ci/issues"
   },
   "engines": {
     "node": ">=18.0.0"
