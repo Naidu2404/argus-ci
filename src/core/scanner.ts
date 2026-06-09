@@ -39,10 +39,10 @@ export async function scanFiles(
   // Pass 1: Opengrep / Semgrep — security patterns (always)
   const primaryResult = await runPrimaryScanner(eligible, cwd, config, t0);
 
-  // Pass 2: Bearer — deep data-flow security (skip for single-file MCP calls)
+  // Pass 2: Bearer — deep data-flow security (skip for single-file MCP calls — too slow)
   const runBearer  = config.runBearer  ?? (eligible.length > 1);
-  // Pass 3: Quality linter — code quality (skip for single-file MCP calls)
-  const runQuality = config.runQuality ?? (eligible.length > 1);
+  // Pass 3: Quality linter — always run (Oxlint/Ruff are fast enough for single files)
+  const runQuality = config.runQuality ?? true;
 
   const results: ScanResult[] = [primaryResult];
 

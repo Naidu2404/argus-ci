@@ -2,17 +2,15 @@
  * Pluggable code-quality engine.
  *
  * Runs the right linter for the detected stack:
- *   JS/TS  → Oxlint   (500+ rules, Rust-speed, zero config)
- *   Python → Ruff     (800+ rules, Rust-speed, drop-in Flake8+isort)
- *   Go     → golangci-lint  (aggregates 50+ Go linters)
- *   Ruby   → RuboCop  (community standard Ruby linter)
- *   Java   → PMD      (static analysis, complexity, duplicates)
- *
- * Each engine is optional — if not installed, quality scan is skipped
- * gracefully without blocking the security scan.
+ *   JS/TS  → Oxlint        (500+ rules, Rust-speed, zero config)
+ *   Python → Ruff          (800+ rules, Rust-speed, drop-in Flake8+isort)
+ *   Go     → golangci-lint (aggregates 50+ Go linters)
+ *   Ruby   → RuboCop       (community standard Ruby linter)
+ *   Java   → PMD           (static analysis, complexity, duplicates)
  */
 
 import { spawnSync } from "child_process";
+import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import type { Issue, QualityEngine, ScanResult } from "../types.js";
@@ -36,65 +34,162 @@ export async function runQualityScan(
 
   try {
     switch (engine) {
-      case "oxlint":       return runOxlint(files, cwd, binary, t0);
-      case "ruff":         return runRuff(files, cwd, binary, t0);
-      case "golangci-lint":return runGolangci(files, cwd, binary, t0);
-      case "rubocop":      return runRubocop(files, cwd, binary, t0);
-      case "pmd":          return runPMD(files, cwd, binary, t0);
-      default:             return skip(`Unknown quality engine: ${engine}`, t0);
+      case "oxlint":        return runOxlint(files, cwd, binary, t0);
+      case "ruff":          return runRuff(files, cwd, binary, t0);
+      case "golangci-lint": return runGolangci(files, cwd, binary, t0);
+      case "rubocop":       return runRubocop(files, cwd, binary, t0);
+      case "pmd":           return runPMD(files, cwd, binary, t0);
+      default:              return skip(`Unknown quality engine: ${engine}`, t0);
     }
   } catch (err) {
     return skip(`${engine} error: ${String(err).slice(0, 200)}`, t0);
   }
 }
 
-// ─── Oxlint (JS / TS) ────────────────────────────────────────────────────────
+// ─── Oxlint (JS / TS / Vue / React) ──────────────────────────────────────────
 
 function runOxlint(files: string[], cwd: string, binary: string, t0: number): ScanResult {
-  // oxlint --format json <files>
-  const result = spawnSync(binary, ["--format", "json", ...files], {
+  // Build plugin flags based on what the project uses
+  const pluginFlags = detectOxlintPlugins(cwd);
+
+  // oxlint --format json [plugins] <files>
+  // Always run: default rules (95+)
+  // + typescript plugin (on by default)
+  // + detected framework plugins
+  const args = [
+    "--format", "json",
+    ...pluginFlags,
+    "--",          // separator so file paths aren't misread as flags
+    ...files,
+  ];
+
+  const result = spawnSync(binary, args, {
     cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024,
   });
 
-  // oxlint exits 1 when issues found — that's fine
-  const stdout = result.stdout ?? "";
-  if (!stdout.trim()) return clean(files.length, t0, "oxlint");
+  // Oxlint exits 1 when issues found — that's expected
+  const stdout = (result.stdout ?? "").trim();
+  if (!stdout) return clean(files.length, t0, "oxlint");
 
   let raw: OxlintOutput;
   try {
     raw = JSON.parse(stdout) as OxlintOutput;
   } catch {
-    return skip("Failed to parse oxlint output", t0);
+    // Oxlint sometimes emits partial JSON when it hits a parse error in a file
+    // Try to extract the diagnostics array manually
+    const match = stdout.match(/"diagnostics"\s*:\s*(\[[\s\S]*?\])/);
+    if (match) {
+      try {
+        const diags = JSON.parse(match[1]!) as OxlintDiagnostic[];
+        raw = { diagnostics: diags };
+      } catch {
+        return skip("Failed to parse oxlint output", t0);
+      }
+    } else {
+      return skip("Failed to parse oxlint output", t0);
+    }
   }
 
-  const issues: Issue[] = raw.diagnostics.map((d) => ({
-    ruleId:     d.rule_id ?? "oxlint/unknown",
-    path:       d.filename,
-    line:       d.labels[0]?.span?.start?.line ?? 1,
-    col:        d.labels[0]?.span?.start?.column ?? 1,
-    severity:   mapOxlintSeverity(d.severity),
-    message:    d.message,
-    sourceLine: d.labels[0]?.message,
-    engine:     "oxlint",
-  }));
+  const issues: Issue[] = (raw.diagnostics ?? []).map((d) => {
+    // Actual field from oxlint JSON: "code" (e.g. "eslint(no-eval)")
+    // Position: labels[0].span.line / labels[0].span.column  (1-based)
+    const span = d.labels[0]?.span;
+    return {
+      ruleId:     d.code ?? "oxlint/unknown",
+      path:       d.filename,
+      line:       span?.line ?? 1,
+      col:        span?.column ?? 1,
+      severity:   mapOxlintSeverity(d.severity),
+      message:    d.message + (d.help ? `\n  💡 ${d.help}` : ""),
+      sourceLine: d.labels[0]?.label,
+      engine:     "oxlint",
+    };
+  });
+
+  const ruleset = pluginFlags.length
+    ? `oxlint/recommended+${pluginFlags.filter((f) => f.endsWith("-plugin")).map((f) => f.replace("--", "").replace("-plugin", "")).join("+")}`
+    : "oxlint/recommended";
 
   return {
     issues, skipped: false,
     filesScanned: files.length, durationMs: Date.now() - t0,
-    rulesets: ["oxlint/recommended"], engines: ["oxlint"],
+    rulesets: [ruleset], engines: ["oxlint"],
   };
+}
+
+/** Auto-detect which Oxlint plugins to enable based on package.json */
+function detectOxlintPlugins(cwd: string): string[] {
+  const flags: string[] = [];
+  const pkgPath = join(cwd, "package.json");
+  if (!existsSync(pkgPath)) return flags;
+
+  let pkg: Record<string, unknown>;
+  try {
+    pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as Record<string, unknown>;
+  } catch { return flags; }
+
+  const allDeps = {
+    ...((pkg.dependencies   as Record<string, string>) ?? {}),
+    ...((pkg.devDependencies as Record<string, string>) ?? {}),
+  };
+
+  // React (also enables react-perf for performance issues)
+  if (allDeps["react"] || allDeps["react-dom"]) {
+    flags.push("--react-plugin");
+    flags.push("--react-perf-plugin");
+    flags.push("--jsx-a11y-plugin");
+  }
+
+  // Vue
+  if (allDeps["vue"] || allDeps["@vue/core"] || allDeps["@vue/cli-service"]) {
+    flags.push("--vue-plugin");
+  }
+
+  // Next.js
+  if (allDeps["next"]) {
+    flags.push("--nextjs-plugin");
+  }
+
+  // Jest
+  if (allDeps["jest"] || allDeps["@jest/core"] || allDeps["vitest"]) {
+    flags.push(allDeps["vitest"] ? "--vitest-plugin" : "--jest-plugin");
+  }
+
+  // Promises
+  if (Object.keys(allDeps).some((d) => d.includes("promise") || d.includes("async"))) {
+    flags.push("--promise-plugin");
+  }
+
+  // Node.js
+  const serverDeps = ["express", "fastify", "koa", "@nestjs/core", "hapi"];
+  if (serverDeps.some((d) => d in allDeps)) {
+    flags.push("--node-plugin");
+  }
+
+  // Always enable import plugin (catches missing imports, circular deps)
+  flags.push("--import-plugin");
+
+  // Always enable promise plugin (catches unhandled promises)
+  flags.push("--promise-plugin");
+
+  return [...new Set(flags)]; // dedupe
 }
 
 // ─── Ruff (Python) ───────────────────────────────────────────────────────────
 
 function runRuff(files: string[], cwd: string, binary: string, t0: number): ScanResult {
-  // ruff check --output-format json <files>
-  const result = spawnSync(binary, ["check", "--output-format", "json", ...files], {
-    cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024,
-  });
+  // ruff check --output-format json --select ALL <files>
+  // Use ALL rules for maximum coverage; ignore auto-fixable style-only issues
+  const result = spawnSync(
+    binary,
+    ["check", "--output-format", "json", "--select", "ALL",
+     "--ignore", "D,ANN,ERA,FIX,TD", // skip docstring, annotations, commented-out code
+     ...files],
+    { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 }
+  );
 
-  const stdout = result.stdout ?? "";
-  if (!stdout.trim()) return clean(files.length, t0, "ruff");
+  const stdout = (result.stdout ?? "").trim();
+  if (!stdout) return clean(files.length, t0, "ruff");
 
   let raw: RuffFinding[];
   try {
@@ -108,7 +203,7 @@ function runRuff(files: string[], cwd: string, binary: string, t0: number): Scan
     path:     f.filename,
     line:     f.location.row,
     col:      f.location.column,
-    severity: f.fix ? "warning" : "warning", // ruff doesn't have error/info — warnings only
+    severity: mapRuffSeverity(f.code),
     message:  f.message,
     engine:   "ruff",
   }));
@@ -116,21 +211,19 @@ function runRuff(files: string[], cwd: string, binary: string, t0: number): Scan
   return {
     issues, skipped: false,
     filesScanned: files.length, durationMs: Date.now() - t0,
-    rulesets: ["ruff/all"], engines: ["ruff"],
+    rulesets: ["ruff/ALL"], engines: ["ruff"],
   };
 }
 
 // ─── golangci-lint (Go) ───────────────────────────────────────────────────────
 
 function runGolangci(files: string[], cwd: string, binary: string, t0: number): ScanResult {
-  // golangci-lint run --out-format json ./...
-  // Files are scoped by running from the cwd (package level)
   const result = spawnSync(binary, ["run", "--out-format", "json", "--timeout", "60s", "./..."], {
     cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024, timeout: 90_000,
   });
 
-  const stdout = result.stdout ?? "";
-  if (!stdout.trim()) return clean(files.length, t0, "golangci-lint");
+  const stdout = (result.stdout ?? "").trim();
+  if (!stdout) return clean(files.length, t0, "golangci-lint");
 
   let raw: GolangciOutput;
   try {
@@ -139,7 +232,6 @@ function runGolangci(files: string[], cwd: string, binary: string, t0: number): 
     return skip("Failed to parse golangci-lint output", t0);
   }
 
-  // Filter to only files we were asked about
   const fileSet = new Set(files.map((f) => (f.startsWith("/") ? f : join(cwd, f))));
 
   const issues: Issue[] = (raw.Issues ?? [])
@@ -167,13 +259,12 @@ function runGolangci(files: string[], cwd: string, binary: string, t0: number): 
 // ─── RuboCop (Ruby) ───────────────────────────────────────────────────────────
 
 function runRubocop(files: string[], cwd: string, binary: string, t0: number): ScanResult {
-  // rubocop --format json <files>
   const result = spawnSync(binary, ["--format", "json", ...files], {
     cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024,
   });
 
-  const stdout = result.stdout ?? "";
-  if (!stdout.trim()) return clean(files.length, t0, "rubocop");
+  const stdout = (result.stdout ?? "").trim();
+  if (!stdout) return clean(files.length, t0, "rubocop");
 
   let raw: RubocopOutput;
   try {
@@ -204,7 +295,6 @@ function runRubocop(files: string[], cwd: string, binary: string, t0: number): S
 // ─── PMD (Java) ───────────────────────────────────────────────────────────────
 
 function runPMD(files: string[], cwd: string, binary: string, t0: number): ScanResult {
-  // pmd check --format json --dir <files joined by comma>
   const result = spawnSync(
     binary,
     ["check", "--format", "json", "--rulesets", "rulesets/java/quickstart.xml",
@@ -212,8 +302,8 @@ function runPMD(files: string[], cwd: string, binary: string, t0: number): ScanR
     { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024, timeout: 60_000 }
   );
 
-  const stdout = result.stdout ?? "";
-  if (!stdout.trim()) return clean(files.length, t0, "pmd");
+  const stdout = (result.stdout ?? "").trim();
+  if (!stdout) return clean(files.length, t0, "pmd");
 
   let raw: PMDOutput;
   try {
@@ -243,12 +333,10 @@ function runPMD(files: string[], cwd: string, binary: string, t0: number): ScanR
 
 function findEngine(engine: QualityEngine): string | null {
   const candidates = engineCandidates(engine);
-  const versionFlag = engine === "golangci-lint" ? ["--version"] :
-                      engine === "pmd"            ? ["--version"] :
-                      engine === "rubocop"        ? ["--version"] :
-                      ["--version"];
+  const versionFlag = ["--version"];
 
   for (const cmd of candidates) {
+    if (!cmd) continue;
     const r = spawnSync(cmd, versionFlag, { encoding: "utf8" });
     if (r.status === 0) return cmd;
   }
@@ -265,8 +353,7 @@ function engineCandidates(engine: QualityEngine): string[] {
         "/opt/homebrew/bin/oxlint",
         join(home, ".local", "bin", "oxlint"),
         join(home, ".npm-global", "bin", "oxlint"),
-        // npx fallback — always works but slow for repeated calls
-        // we avoid this as a detection method
+        join(home, "node_modules", ".bin", "oxlint"),
       ];
     case "ruff":
       return [
@@ -296,13 +383,21 @@ function engineCandidates(engine: QualityEngine): string[] {
 // ─── Severity mappers ────────────────────────────────────────────────────────
 
 function mapOxlintSeverity(s: string): Issue["severity"] {
-  if (s === "error")   return "error";
-  if (s === "warning") return "warning";
+  const lower = s.toLowerCase();
+  if (lower === "error")   return "error";
+  if (lower === "warning") return "warning";
   return "info";
 }
 
+function mapRuffSeverity(code: string): Issue["severity"] {
+  // E = error, W = warning, everything else = info
+  if (code.startsWith("E")) return "error";
+  if (code.startsWith("W")) return "warning";
+  return "warning"; // most Ruff codes are quality warnings
+}
+
 function mapRubocopSeverity(s: string): Issue["severity"] {
-  if (s === "error" || s === "fatal")  return "error";
+  if (s === "error" || s === "fatal")                             return "error";
   if (s === "warning" || s === "convention" || s === "refactor") return "warning";
   return "info";
 }
@@ -331,19 +426,27 @@ function clean(filesScanned: number, t0: number, engine: QualityEngine): ScanRes
   };
 }
 
-// ─── Raw output types ────────────────────────────────────────────────────────
+// ─── Raw output types ─────────────────────────────────────────────────────────
+
+interface OxlintDiagnostic {
+  code?:     string;        // e.g. "eslint(no-eval)"  — NOT rule_id
+  severity:  string;        // "warning" | "error"
+  message:   string;
+  help?:     string;        // human-readable fix hint
+  filename:  string;
+  labels: Array<{
+    label?:  string;        // optional label text shown inline
+    span: {
+      line:   number;       // 1-based line   — NOT span.start.line
+      column: number;       // 1-based column — NOT span.start.column
+      offset: number;
+      length: number;
+    };
+  }>;
+}
 
 interface OxlintOutput {
-  diagnostics: Array<{
-    rule_id?:  string;
-    severity:  string;
-    message:   string;
-    filename:  string;
-    labels: Array<{
-      message?: string;
-      span?: { start?: { line: number; column: number } };
-    }>;
-  }>;
+  diagnostics: OxlintDiagnostic[];
 }
 
 interface RuffFinding {
