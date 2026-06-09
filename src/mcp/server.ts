@@ -3,6 +3,7 @@
  *
  * Exposes four tools to Cursor / Claude Code / any MCP client:
  *
+ *   scan_repo    — scan entire repository (all source files, all passes)
  *   scan_files   — scan specific files (called post code-generation)
  *   scan_staged  — scan git staged files (pre-commit check)
  *   scan_branch  — scan changed files on a branch vs base
@@ -18,7 +19,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { scanFiles, scanStaged, scanBranch } from "../core/scanner.js";
+import { scanFiles, scanStaged, scanBranch, scanRepo } from "../core/scanner.js";
 import { fetchPRFiles, postPRComment } from "../core/github.js";
 import { detectRulesets } from "../core/detector.js";
 import { toMarkdown, toPRComment } from "../core/reporter.js";
@@ -187,6 +188,38 @@ server.tool(
     return {
       content: [{ type: "text" as const, text: markdown }],
       isError: result.issues.some((i) => i.severity === "error"),
+    };
+  }
+);
+
+// ─── Tool: scan_repo ──────────────────────────────────────────────────────────
+
+server.tool(
+  "scan_repo",
+  "Scan the ENTIRE repository for security vulnerabilities AND code quality issues. " +
+  "Use this when asked to audit a whole codebase, find all issues, or do a full security review. " +
+  "Automatically discovers all source files via git and runs Opengrep (security) + Bearer (data-flow) + Oxlint/Ruff/etc (quality) in one pass.",
+  {
+    cwd: z.string().optional().describe(
+      "Repo root directory. Defaults to process.cwd(). " +
+      "Pass the absolute path to the repository you want to scan."
+    ),
+    rulesets: z.array(z.string()).optional().describe(
+      "Override Semgrep rulesets. Defaults to auto-detected from stack."
+    ),
+  },
+  async ({ cwd, rulesets }) => {
+    const workdir = cwd ?? process.cwd();
+    const detected = detectRulesets(workdir);
+    const config = { rulesets: rulesets ?? detected.rulesets };
+
+    const result   = await scanRepo(workdir, config);
+    const markdown = toMarkdown(result, `full repository (${result.filesScanned} files)`);
+    const hasErrors = result.issues.some((i) => i.severity === "error");
+
+    return {
+      content: [{ type: "text" as const, text: markdown }],
+      isError: hasErrors,
     };
   }
 );

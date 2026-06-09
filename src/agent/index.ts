@@ -13,7 +13,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import * as readline from "readline";
-import { scanFiles, scanStaged, scanBranch } from "../core/scanner.js";
+import { scanFiles, scanStaged, scanBranch, scanRepo } from "../core/scanner.js";
 import { fetchPRFiles } from "../core/github.js";
 import { detectRulesets } from "../core/detector.js";
 import { toMarkdown } from "../core/reporter.js";
@@ -24,6 +24,20 @@ const MODEL = "claude-opus-4-6";
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 const TOOLS: Anthropic.Tool[] = [
+  {
+    name: "scan_repo",
+    description: "Scan the ENTIRE repository for security vulnerabilities AND code quality issues. " +
+                 "Use when asked to audit a codebase, find all issues, or do a full review. " +
+                 "Runs Opengrep (security) + Bearer (data-flow) + quality linter (Oxlint/Ruff/etc) on all source files.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        cwd:      { type: "string", description: "Repo root directory. Defaults to current directory." },
+        rulesets: { type: "array", items: { type: "string" }, description: "Override Semgrep rulesets." },
+      },
+      required: [],
+    },
+  },
   {
     name: "scan_files",
     description: "Scan specific files with Semgrep for security issues.",
@@ -90,6 +104,11 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
 
   try {
     switch (name) {
+      case "scan_repo": {
+        const result = await scanRepo(cwd, config);
+        return toMarkdown(result, `full repository (${result.filesScanned} files)`);
+      }
+
       case "scan_files": {
         const files = input.files as string[];
         const result = await scanFiles(files, cwd, config);
@@ -144,6 +163,7 @@ export async function runAgent(userMessage: string): Promise<void> {
 Your job is to run security scans on code and clearly explain the findings.
 
 When the user asks you to:
+- "scan this repo" / "audit the codebase" / "find all issues" / "full scan" → use scan_repo
 - "scan files X, Y, Z" → use scan_files
 - "check my changes" / "check staged files" / "before I commit" → use scan_staged
 - "review branch X" / "check branch X" → use scan_branch
@@ -211,6 +231,7 @@ Use the current working directory (${process.cwd()}) unless the user specifies o
 export async function startRepl(): Promise<void> {
   console.log("🔍 Semgrep Agent — type your request or 'exit' to quit\n");
   console.log("Examples:");
+  console.log("  scan this repo           — full audit: security + quality on every file");
   console.log("  review PR https://github.com/org/repo/pull/42");
   console.log("  scan branch feature/auth");
   console.log("  check my staged changes\n");

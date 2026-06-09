@@ -108,6 +108,8 @@ export interface ScanConfig {
   runQuality?:    boolean;
   /** Override which quality engine to use (auto-detected from stack if omitted) */
   qualityEngine?: QualityEngine;
+  /** Internal: when true, quality engine scans the whole directory instead of individual files */
+  _isRepoScan?:   boolean;
 }
 
 // ─── Agent tool response ──────────────────────────────────────────────────────

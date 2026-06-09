@@ -31,30 +31,37 @@ export async function scanFiles(
 ): Promise<ScanResult> {
   const t0 = Date.now();
   const eligible = filterEligible(files, cwd, config);
+  if (eligible.length === 0) return empty("No eligible files to scan", t0, config);
+  return scanFilesInternal(eligible, cwd, config, t0);
+}
 
-  if (eligible.length === 0) {
-    return empty("No eligible files to scan", t0, config);
-  }
-
+async function scanFilesInternal(
+  files:  string[],
+  cwd:    string,
+  config: ScanConfig,
+  t0:     number
+): Promise<ScanResult> {
   // Pass 1: Opengrep / Semgrep — security patterns (always)
-  const primaryResult = await runPrimaryScanner(eligible, cwd, config, t0);
+  const primaryResult = await runPrimaryScanner(files, cwd, config, t0);
 
-  // Pass 2: Bearer — deep data-flow security (skip for single-file MCP calls — too slow)
-  const runBearer  = config.runBearer  ?? (eligible.length > 1);
-  // Pass 3: Quality linter — always run (Oxlint/Ruff are fast enough for single files)
+  // Pass 2: Bearer — deep data-flow (skip for single-file calls — too slow)
+  const runBearer  = config.runBearer  ?? (files.length > 1);
+  // Pass 3: Quality linter — always run (fast Rust-based tools)
   const runQuality = config.runQuality ?? true;
 
   const results: ScanResult[] = [primaryResult];
 
   if (runBearer && isBearerInstalled()) {
-    results.push(await runBearerScan(eligible, cwd, t0));
+    results.push(await runBearerScan(files, cwd, t0));
   }
 
   if (runQuality) {
-    const stackInfo   = detectRulesets(cwd);
-    const engine      = config.qualityEngine ?? stackInfo.qualityEngine;
+    const stackInfo = detectRulesets(cwd);
+    const engine    = config.qualityEngine ?? stackInfo.qualityEngine;
     if (engine && isQualityEngineInstalled(engine)) {
-      results.push(await runQualityScan(eligible, cwd, engine, t0));
+      // For large repo scans, tell quality engine to use directory mode (faster, avoids arg-length limits)
+      const isRepoScan = config._isRepoScan ?? false;
+      results.push(await runQualityScan(files, cwd, engine, t0, isRepoScan));
     }
   }
 
@@ -80,6 +87,56 @@ export async function scanStaged(cwd: string, config: ScanConfig = {}): Promise<
     runBearer:  config.runBearer  ?? true,
     runQuality: config.runQuality ?? true,
   });
+}
+
+/** Source file extensions to include in repo scans */
+const SOURCE_EXTENSIONS = new Set([
+  "ts", "tsx", "js", "jsx", "mjs", "cjs", "vue", "svelte",
+  "py", "pyi",
+  "go",
+  "java", "kt", "kts", "groovy",
+  "rb",
+  "php",
+  "sh", "bash",
+  "json", "yaml", "yml", "toml",
+  "html", "htm",
+  "tf", "hcl",      // Terraform
+  "sql",
+]);
+
+/** Scan the entire repository — all tracked source files in one pass */
+export async function scanRepo(cwd: string, config: ScanConfig = {}): Promise<ScanResult> {
+  const t0 = Date.now();
+
+  // Collect all git-tracked source files
+  let allFiles: string[];
+  try {
+    const out = execSync("git ls-files --cached", { cwd, encoding: "utf8" });
+    allFiles = out.trim().split("\n").filter(Boolean);
+  } catch {
+    return empty(
+      "scan_repo requires a git repository. Navigate to the repo root and try again.",
+      t0, config
+    );
+  }
+
+  // Keep only source code files (skip images, fonts, lock files, etc.)
+  const sourceFiles = allFiles.filter((f) => {
+    const ext = f.split(".").pop()?.toLowerCase() ?? "";
+    return SOURCE_EXTENSIONS.has(ext);
+  });
+
+  if (sourceFiles.length === 0) {
+    return empty("No source files found in repository.", t0, config);
+  }
+
+  // For repo scans always run all three passes
+  return scanFilesInternal(sourceFiles, cwd, {
+    ...config,
+    runBearer:  config.runBearer  ?? true,
+    runQuality: config.runQuality ?? true,
+    _isRepoScan: true,       // hint for quality engine to use directory mode
+  }, t0);
 }
 
 export async function scanBranch(

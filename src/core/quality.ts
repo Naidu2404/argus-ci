@@ -22,10 +22,11 @@ export function isQualityEngineInstalled(engine: QualityEngine): boolean {
 }
 
 export async function runQualityScan(
-  files:  string[],
-  cwd:    string,
-  engine: QualityEngine,
-  t0:     number
+  files:       string[],
+  cwd:         string,
+  engine:      QualityEngine,
+  t0:          number,
+  isRepoScan = false   // when true, scan cwd directory instead of listing every file
 ): Promise<ScanResult> {
   const binary = findEngine(engine);
   if (!binary) {
@@ -34,8 +35,8 @@ export async function runQualityScan(
 
   try {
     switch (engine) {
-      case "oxlint":        return runOxlint(files, cwd, binary, t0);
-      case "ruff":          return runRuff(files, cwd, binary, t0);
+      case "oxlint":        return runOxlint(files, cwd, binary, t0, isRepoScan);
+      case "ruff":          return runRuff(files, cwd, binary, t0, isRepoScan);
       case "golangci-lint": return runGolangci(files, cwd, binary, t0);
       case "rubocop":       return runRubocop(files, cwd, binary, t0);
       case "pmd":           return runPMD(files, cwd, binary, t0);
@@ -48,19 +49,19 @@ export async function runQualityScan(
 
 // ─── Oxlint (JS / TS / Vue / React) ──────────────────────────────────────────
 
-function runOxlint(files: string[], cwd: string, binary: string, t0: number): ScanResult {
-  // Build plugin flags based on what the project uses
+function runOxlint(files: string[], cwd: string, binary: string, t0: number, isRepoScan = false): ScanResult {
   const pluginFlags = detectOxlintPlugins(cwd);
 
-  // oxlint --format json [plugins] <files>
-  // Always run: default rules (95+)
-  // + typescript plugin (on by default)
-  // + detected framework plugins
+  // For repo scans or large file sets (> 50 files): scan the directory directly.
+  // This avoids "Argument list too long" OS errors and is significantly faster.
+  // Oxlint respects .gitignore and skips node_modules automatically.
+  const targets = (isRepoScan || files.length > 50) ? [cwd] : files;
+
   const args = [
     "--format", "json",
     ...pluginFlags,
-    "--",          // separator so file paths aren't misread as flags
-    ...files,
+    "--",
+    ...targets,
   ];
 
   const result = spawnSync(binary, args, {
@@ -177,14 +178,13 @@ function detectOxlintPlugins(cwd: string): string[] {
 
 // ─── Ruff (Python) ───────────────────────────────────────────────────────────
 
-function runRuff(files: string[], cwd: string, binary: string, t0: number): ScanResult {
-  // ruff check --output-format json --select ALL <files>
-  // Use ALL rules for maximum coverage; ignore auto-fixable style-only issues
+function runRuff(files: string[], cwd: string, binary: string, t0: number, isRepoScan = false): ScanResult {
+  const targets = (isRepoScan || files.length > 50) ? [cwd] : files;
   const result = spawnSync(
     binary,
     ["check", "--output-format", "json", "--select", "ALL",
-     "--ignore", "D,ANN,ERA,FIX,TD", // skip docstring, annotations, commented-out code
-     ...files],
+     "--ignore", "D,ANN,ERA,FIX,TD",
+     ...targets],
     { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024 }
   );
 
