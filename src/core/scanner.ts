@@ -11,6 +11,7 @@
 import { execSync, spawnSync } from "child_process";
 import { existsSync, readFileSync, statSync } from "fs";
 import { join } from "path";
+import { homedir } from "os";
 import type {
   Issue, ScanConfig, ScanResult, ScanEngine,
   SemgrepFinding, SemgrepRawResult,
@@ -269,8 +270,20 @@ function mergeResults(primary: ScanResult, bearer: ScanResult, t0: number): Scan
 // ─── Scanner detection ────────────────────────────────────────────────────────
 
 function findPrimaryScanner(): { binary: string; engine: ScanEngine } | null {
+  const home = homedir();
+
   // Try opengrep first — has free taint analysis
-  for (const candidate of ["opengrep", "/usr/local/bin/opengrep", "/opt/homebrew/bin/opengrep"]) {
+  // Checks system PATH, Homebrew, and official install location (~/.opengrep/cli/latest/opengrep)
+  const opengrepCandidates = [
+    "opengrep",
+    "/usr/local/bin/opengrep",
+    "/opt/homebrew/bin/opengrep",
+    join(home, ".opengrep", "cli", "latest", "opengrep"),
+    join(home, ".opengrep", "bin", "opengrep"),
+    join(home, ".opengrep", "opengrep"),
+    join(home, ".local", "bin", "opengrep"),
+  ];
+  for (const candidate of opengrepCandidates) {
     const r = spawnSync(candidate, ["--version"], { encoding: "utf8" });
     if (r.status === 0) return { binary: candidate, engine: "opengrep" };
   }

@@ -140,30 +140,21 @@ async function ensurePrimaryScanner(): Promise<void> {
 }
 
 function tryInstallOpengrep(): boolean {
-  const pipCmd = commandExists("pip3") ? "pip3" : "pip";
-
-  // Strategy 1: --break-system-packages (bypasses PEP 668 on modern macOS/Linux)
-  console.log(`     → ${pipCmd} install opengrep --break-system-packages`);
-  const r1 = spawnSync(pipCmd, ["install", "opengrep", "--break-system-packages"], { stdio: "inherit" });
-  if (r1.status === 0 && isScannerInstalled("opengrep")) return true;
-
-  // Strategy 2: --user flag (installs to ~/.local/bin or ~/Library/Python/X.Y/bin)
-  console.log(`     → ${pipCmd} install opengrep --user`);
-  const r2 = spawnSync(pipCmd, ["install", "opengrep", "--user"], { stdio: "inherit" });
-  if (r2.status === 0 && isScannerInstalled("opengrep")) return true;
-
-  // Strategy 3: pipx (manages its own venv, works everywhere)
-  if (commandExists("pipx")) {
-    console.log("     → pipx install opengrep");
-    const r3 = spawnSync("pipx", ["install", "opengrep"], { stdio: "inherit" });
-    if (r3.status === 0 && isScannerInstalled("opengrep")) return true;
+  // Opengrep is NOT on PyPI — install via the official install script (like Bearer).
+  // It installs to ~/.opengrep/cli/latest/opengrep
+  if (!commandExists("curl")) {
+    console.log("     ℹ️  curl not found — cannot download Opengrep");
+    return false;
   }
 
-  // Strategy 4: python3 -m pip with --break-system-packages (alternate pip entrypoint)
-  const r4 = spawnSync("python3", ["-m", "pip", "install", "opengrep", "--break-system-packages"], { stdio: "inherit" });
-  if (r4.status === 0 && isScannerInstalled("opengrep")) return true;
+  console.log("     → curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash");
+  const r = spawnSync(
+    "bash",
+    ["-c", "curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash"],
+    { stdio: "inherit" }
+  );
 
-  return false;
+  return r.status === 0 && isScannerInstalled("opengrep");
 }
 
 function tryInstallSemgrep(): boolean {
@@ -179,18 +170,23 @@ function tryInstallSemgrep(): boolean {
   return r.status === 0 && isScannerInstalled("semgrep");
 }
 
+function opengrepPaths(): string[] {
+  // Official install script puts binary at ~/.opengrep/cli/latest/opengrep
+  // Also check ~/.opengrep/bin/opengrep as a fallback path
+  return [
+    join(homedir(), ".opengrep", "cli", "latest", "opengrep"),
+    join(homedir(), ".opengrep", "bin", "opengrep"),
+    join(homedir(), ".opengrep", "opengrep"),
+  ];
+}
+
 function isScannerInstalled(scanner: "opengrep" | "semgrep"): boolean {
-  // Common install locations — system, Homebrew, user-local (--user flag), pipx
   const candidates = [
     scanner,
     `/usr/local/bin/${scanner}`,
     `/opt/homebrew/bin/${scanner}`,
     join(homedir(), ".local", "bin", scanner),
-    join(homedir(), ".pipx", "bin", scanner),
-    // macOS ~/Library/Python/X.Y/bin — check common versions
-    ...["3.13", "3.12", "3.11", "3.10"].map((v) =>
-      join(homedir(), "Library", "Python", v, "bin", scanner)
-    ),
+    ...(scanner === "opengrep" ? opengrepPaths() : []),
   ];
 
   for (const cmd of candidates) {
@@ -209,10 +205,7 @@ function getScannerVersion(scanner: "opengrep" | "semgrep"): string {
     `/usr/local/bin/${scanner}`,
     `/opt/homebrew/bin/${scanner}`,
     join(homedir(), ".local", "bin", scanner),
-    join(homedir(), ".pipx", "bin", scanner),
-    ...["3.13", "3.12", "3.11", "3.10"].map((v) =>
-      join(homedir(), "Library", "Python", v, "bin", scanner)
-    ),
+    ...(scanner === "opengrep" ? opengrepPaths() : []),
   ];
 
   for (const cmd of candidates) {
