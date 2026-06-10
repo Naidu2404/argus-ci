@@ -34,13 +34,18 @@ export async function runSonarCheck(
     return skip("SONAR_TOKEN not configured — run `npx argus-ci setup --configure` to add it", t0);
   }
 
-  const projectKey = getSonarProjectKey();
+  // Per-repo .argus-ci.json takes priority over global ~/.argus-ci.json
+  const projectKey = getSonarProjectKey(cwd);
   if (!projectKey) {
-    return skip("SONAR_PROJECT_KEY not configured — run `npx argus-ci setup --configure` to add it", t0);
+    return skip(
+      "SONAR_PROJECT_KEY not set — run `npx argus-ci setup --configure` in this repo to set it, " +
+      "or add it to .argus-ci.json: { \"sonarProjectKey\": \"your_project_key\" }",
+      t0
+    );
   }
 
-  const serverUrl  = getSonarServerUrl().replace(/\/$/, "");
-  const org        = getSonarOrganization();
+  const serverUrl = getSonarServerUrl(cwd).replace(/\/$/, "");
+  const org       = getSonarOrganization(cwd);
 
   // Build the component path filter from our file list
   // Sonar uses "projectKey:src/path/to/file.ts" format

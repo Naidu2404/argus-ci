@@ -17,7 +17,7 @@ import { createInterface } from "readline";
 import { fileURLToPath } from "url";
 import { platform, homedir } from "os";
 import { detectRulesets } from "../core/detector.js";
-import { loadConfig, saveConfig } from "../core/config.js";
+import { loadConfig, saveGlobalConfig, saveLocalConfig, getGlobalConfigPath } from "../core/config.js";
 import type { QualityEngine } from "../types.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -64,7 +64,7 @@ export async function setupHook(cwd: string): Promise<void> {
   }
 
   if (configure) {
-    await runConfigureWizard();
+    await runConfigureWizard(cwd);
     return;
   }
 
@@ -538,85 +538,119 @@ function installPreCommitHook(cwd: string): void {
 
 // ─── Credential wizard ────────────────────────────────────────────────────────
 
-async function runConfigureWizard(): Promise<void> {
-  console.log("\n🔑 argus-ci credential setup\n");
-  console.log("This wizard stores API keys in ~/.argus-ci.json (mode 600 — readable only by you).");
-  console.log("Press Enter to keep the existing value, or type a new one.\n");
+async function runConfigureWizard(cwd: string): Promise<void> {
+  console.log("\n🔑 argus-ci configure\n");
 
-  const existing = loadConfig();
+  // Show which repo we're in
+  const inRepo = existsSync(join(cwd, ".git"));
+  const repoName = cwd.split("/").pop() ?? cwd;
+
+  console.log("Two config tiers:");
+  console.log(`  🌐 Global   ~/.argus-ci.json          — credentials (SONAR_TOKEN, GROQ_API_KEY, GITHUB_TOKEN)`);
+  console.log(`  📁 Per-repo ./.argus-ci.json           — project settings (SONAR_PROJECT_KEY)`);
+  console.log(`             applies to: ${inRepo ? repoName : "(not a git repo — will still save global)"}`);
+  console.log(`\nPress Enter to keep the existing value. Tokens are masked.\n`);
+
+  const globalCfg = loadConfig();          // global only
+  const localCfg  = loadConfig(cwd);      // merged (local overrides global)
+
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-
   const ask = (question: string, current?: string): Promise<string> =>
     new Promise((resolve) => {
-      const display = current ? ` (current: ${maskToken(current)})` : "";
-      rl.question(`  ${question}${display}: `, (ans) => resolve(ans.trim()));
+      const hint = current ? ` (current: ${maskToken(current)})` : "";
+      rl.question(`  ${question}${hint}: `, (ans) => resolve(ans.trim()));
     });
 
-  // ── Groq API key (free AI fix suggestions) ──────────────────────────────────
-  console.log("┌─ AI Fix Suggestions (optional) ─────────────────────────────────────────┐");
-  console.log("│ Groq is free — get a key at https://console.groq.com (signup, no credit │");
-  console.log("│ card). Used for one-line fix hints on error findings.                   │");
-  console.log("└─────────────────────────────────────────────────────────────────────────┘");
-  const groqKey = await ask("GROQ_API_KEY", existing.groqApiKey);
+  // ── GLOBAL: Groq API key ──────────────────────────────────────────────────
+  console.log("──────────────────────────────────────────────────────────────");
+  console.log("🌐 GLOBAL credentials (saved to ~/.argus-ci.json)");
+  console.log("──────────────────────────────────────────────────────────────\n");
+
+  console.log("  GROQ_API_KEY — AI fix suggestions on every error (free)");
+  console.log("  Get one at: https://console.groq.com → API Keys → Create key\n");
+  const groqKey = await ask("GROQ_API_KEY", globalCfg.groqApiKey);
   if (groqKey) {
-    process.stdout.write("  Validating Groq key... ");
-    const groqValid = await validateGroqKey(groqKey);
-    console.log(groqValid ? "✅ valid" : "⚠️  could not validate (saved anyway)");
+    process.stdout.write("  Validating... ");
+    console.log(await validateGroqKey(groqKey) ? "✅ valid" : "⚠️  could not validate (saved anyway)");
   }
 
-  // ── GitHub token (Dependabot alerts) ────────────────────────────────────────
-  console.log("\n┌─ GitHub Token (optional) ────────────────────────────────────────────────┐");
-  console.log("│ Enables Dependabot vulnerability alerts from your GitHub repo.           │");
-  console.log("│ Create at https://github.com/settings/tokens — needs 'security_events'  │");
-  console.log("│ read scope (classic token) or 'Dependabot alerts: Read' (fine-grained). │");
-  console.log("└─────────────────────────────────────────────────────────────────────────┘");
-  const githubToken = await ask("GITHUB_TOKEN", existing.githubToken);
+  // ── GLOBAL: GitHub token ──────────────────────────────────────────────────
+  console.log("\n  GITHUB_TOKEN — Dependabot vulnerability alerts (Pass 5)");
+  console.log("  Get one at: https://github.com/settings/tokens");
+  console.log("  Scope needed: 'Dependabot alerts: Read' (fine-grained) or 'security_events' (classic)\n");
+  const githubToken = await ask("GITHUB_TOKEN", globalCfg.githubToken);
   if (githubToken) {
-    process.stdout.write("  Validating GitHub token... ");
-    const ghValid = await validateGithubToken(githubToken);
-    console.log(ghValid ? "✅ valid" : "⚠️  could not validate (saved anyway)");
+    process.stdout.write("  Validating... ");
+    console.log(await validateGithubToken(githubToken) ? "✅ valid" : "⚠️  could not validate (saved anyway)");
   }
 
-  // ── SonarQube / SonarCloud ────────────────────────────────────────────────
-  console.log("\n┌─ SonarQube / SonarCloud (optional) ─────────────────────────────────────┐");
-  console.log("│ Fetches open issues from your Sonar project.                            │");
-  console.log("│ SonarCloud: https://sonarcloud.io/account/security → generate token    │");
-  console.log("│ SonarQube:  <your-server>/account/security → generate token            │");
-  console.log("└─────────────────────────────────────────────────────────────────────────┘");
-  const sonarToken = await ask("SONAR_TOKEN", existing.sonarToken);
-  const sonarProjectKey = await ask("SONAR_PROJECT_KEY (e.g. myorg_myrepo)", existing.sonarProjectKey);
-  const sonarServerUrl  = await ask("SONAR_SERVER_URL  (leave blank for SonarCloud)", existing.sonarServerUrl);
-  const sonarOrg        = await ask("SONAR_ORGANIZATION (SonarCloud org slug, blank for self-hosted)", existing.sonarOrganization);
+  // ── GLOBAL: Sonar token ───────────────────────────────────────────────────
+  console.log("\n  SONAR_TOKEN — SonarQube/Cloud issues (Pass 6)");
+  console.log("  SonarCloud: https://sonarcloud.io/account/security → Generate token");
+  console.log("  SonarQube:  https://<your-server>/account/security → Generate token\n");
+  const sonarToken = await ask("SONAR_TOKEN", globalCfg.sonarToken);
 
-  if (sonarToken && sonarProjectKey) {
-    process.stdout.write("  Validating Sonar token... ");
-    const sonarValid = await validateSonarToken(
-      sonarToken, sonarProjectKey,
-      sonarServerUrl || "https://sonarcloud.io",
-      sonarOrg || undefined
-    );
-    console.log(sonarValid ? "✅ valid" : "⚠️  could not validate (saved anyway)");
+  // ── PER-REPO: Sonar project settings ─────────────────────────────────────
+  console.log("\n──────────────────────────────────────────────────────────────");
+  console.log(`📁 PER-REPO settings (saved to .argus-ci.json in ${repoName})`);
+  console.log("   Different repos → different project keys. Safe to commit.");
+  console.log("──────────────────────────────────────────────────────────────\n");
+
+  // Show where current project key is coming from
+  const currentProjectKey  = localCfg.sonarProjectKey;
+  const currentServerUrl   = localCfg.sonarServerUrl;
+  const currentOrg         = localCfg.sonarOrganization;
+
+  console.log("  SONAR_PROJECT_KEY — the project key in your Sonar dashboard");
+  console.log("  Find it: SonarCloud project → Administration → Project Key\n");
+  const sonarProjectKey = await ask("SONAR_PROJECT_KEY", currentProjectKey);
+  const sonarServerUrl  = await ask("SONAR_SERVER_URL  (blank = SonarCloud)", currentServerUrl);
+  const sonarOrg        = await ask("SONAR_ORGANIZATION (SonarCloud org slug, blank = self-hosted)", currentOrg);
+
+  // Validate Sonar if both token and key provided
+  if ((sonarToken || globalCfg.sonarToken) && sonarProjectKey) {
+    process.stdout.write("\n  Validating Sonar connection... ");
+    const tokenToTest   = sonarToken || globalCfg.sonarToken!;
+    const serverToTest  = sonarServerUrl || currentServerUrl || "https://sonarcloud.io";
+    const orgToTest     = sonarOrg || currentOrg;
+    const valid = await validateSonarToken(tokenToTest, sonarProjectKey, serverToTest, orgToTest);
+    console.log(valid ? "✅ valid" : "⚠️  could not validate — check project key and organization");
   }
 
   rl.close();
 
-  // Save — only overwrite fields that were provided
-  const config = { ...existing };
-  if (groqKey)         config.groqApiKey      = groqKey;
-  if (githubToken)     config.githubToken     = githubToken;
-  if (sonarToken)      config.sonarToken      = sonarToken;
-  if (sonarProjectKey) config.sonarProjectKey = sonarProjectKey;
-  if (sonarServerUrl)  config.sonarServerUrl  = sonarServerUrl;
-  if (sonarOrg)        config.sonarOrganization = sonarOrg;
+  // ── Save credentials → GLOBAL ~/.argus-ci.json ────────────────────────────
+  const globalUpdates: Record<string, string> = {};
+  if (groqKey)      globalUpdates["groqApiKey"]   = groqKey;
+  if (githubToken)  globalUpdates["githubToken"]  = githubToken;
+  if (sonarToken)   globalUpdates["sonarToken"]   = sonarToken;
 
-  saveConfig(config);
+  if (Object.keys(globalUpdates).length > 0) {
+    saveGlobalConfig(globalUpdates);
+    console.log(`\n  ✅ Credentials saved → ${getGlobalConfigPath()}`);
+  }
 
-  console.log("\n✅ Configuration saved to ~/.argus-ci.json");
-  console.log("\nActive passes:");
-  if (config.groqApiKey || config.anthropicApiKey) console.log("  + AI fix suggestions (Pass +AI)");
-  if (config.githubToken)     console.log("  + Dependabot alerts (Pass 5)");
-  if (config.sonarToken)      console.log("  + SonarQube/Cloud (Pass 6)");
-  console.log("\nRun `npx argus-ci check_setup` to verify the full configuration.\n");
+  // ── Save project settings → LOCAL .argus-ci.json ─────────────────────────
+  const localUpdates: Record<string, string> = {};
+  if (sonarProjectKey) localUpdates["sonarProjectKey"]  = sonarProjectKey;
+  if (sonarServerUrl)  localUpdates["sonarServerUrl"]   = sonarServerUrl;
+  if (sonarOrg)        localUpdates["sonarOrganization"] = sonarOrg;
+
+  if (Object.keys(localUpdates).length > 0) {
+    saveLocalConfig(cwd, localUpdates);
+    console.log(`  ✅ Project config saved → ${join(cwd, ".argus-ci.json")}`);
+    console.log(`     (commit this file — it has no secrets, only project settings)`);
+  }
+
+  // Summary
+  console.log(`
+Passes now active:
+  ${(groqKey || globalCfg.groqApiKey)   ? "✅" : "❌"} AI fix suggestions (+AI)     ${!groqKey && !globalCfg.groqApiKey ? "— add GROQ_API_KEY to enable" : ""}
+  ${(githubToken || globalCfg.githubToken) ? "✅" : "❌"} Dependabot alerts (Pass 5)  ${!githubToken && !globalCfg.githubToken ? "— add GITHUB_TOKEN to enable" : ""}
+  ${(sonarToken || globalCfg.sonarToken) && sonarProjectKey ? "✅" : "❌"} SonarQube/Cloud (Pass 6)    ${!(sonarToken || globalCfg.sonarToken) ? "— add SONAR_TOKEN to enable" : !sonarProjectKey ? "— add SONAR_PROJECT_KEY to enable" : ""}
+
+Run \`npx argus-ci check_setup\` to verify.
+`);
 }
 
 function maskToken(token: string): string {
@@ -636,26 +670,20 @@ async function validateGroqKey(key: string): Promise<boolean> {
 async function validateGithubToken(token: string): Promise<boolean> {
   try {
     const res = await fetch("https://api.github.com/user", {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-      },
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
     });
     return res.ok;
   } catch { return false; }
 }
 
 async function validateSonarToken(
-  token: string, projectKey: string,
-  serverUrl: string, org?: string
+  token: string, projectKey: string, serverUrl: string, org?: string
 ): Promise<boolean> {
   try {
-    const params = new URLSearchParams({ projectKeys: projectKey, ps: "1" });
+    const params = new URLSearchParams({ componentKeys: projectKey, ps: "1" });
     if (org) params.set("organization", org);
     const res = await fetch(`${serverUrl.replace(/\/$/, "")}/api/issues/search?${params}`, {
-      headers: {
-        Authorization: `Basic ${Buffer.from(`${token}:`).toString("base64")}`,
-      },
+      headers: { Authorization: `Basic ${Buffer.from(`${token}:`).toString("base64")}` },
     });
     return res.ok;
   } catch { return false; }
