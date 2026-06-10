@@ -13,9 +13,11 @@ import {
 } from "fs";
 import { join, dirname } from "path";
 import { spawnSync } from "child_process";
+import { createInterface } from "readline";
 import { fileURLToPath } from "url";
 import { platform, homedir } from "os";
 import { detectRulesets } from "../core/detector.js";
+import { loadConfig, saveConfig } from "../core/config.js";
 import type { QualityEngine } from "../types.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -52,11 +54,17 @@ exit 0
 // ─── Main export ──────────────────────────────────────────────────────────────
 
 export async function setupHook(cwd: string): Promise<void> {
-  const remove = process.argv.includes("--remove");
+  const remove    = process.argv.includes("--remove");
+  const configure = process.argv.includes("--configure");
 
   if (remove) {
     const hookPath = join(cwd, ".git", "hooks", "pre-commit");
     await removeHook(hookPath);
+    return;
+  }
+
+  if (configure) {
+    await runConfigureWizard();
     return;
   }
 
@@ -310,6 +318,7 @@ const QUALITY_ENGINE_LABELS: Record<QualityEngine, string> = {
   "golangci-lint": "golangci-lint (Go quality)",
   "rubocop":       "RuboCop (Ruby quality)",
   "pmd":           "PMD (Java quality)",
+  "phpstan":       "PHPStan (PHP static analysis)",
 };
 
 const QUALITY_ENGINE_INSTALL_HINT: Record<QualityEngine, string> = {
@@ -318,6 +327,7 @@ const QUALITY_ENGINE_INSTALL_HINT: Record<QualityEngine, string> = {
   "golangci-lint": "brew install golangci-lint  OR  curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh",
   "rubocop":       "gem install rubocop",
   "pmd":           "brew install pmd",
+  "phpstan":       "composer global require phpstan/phpstan  OR  curl -sL https://github.com/phpstan/phpstan/releases/latest/download/phpstan.phar -o ~/.local/bin/phpstan && chmod +x ~/.local/bin/phpstan",
 };
 
 function isQualityEnginePresent(engine: QualityEngine): boolean {
@@ -346,6 +356,15 @@ function qualityEngineCandidates(engine: QualityEngine): string[] {
       return ["rubocop", "/usr/local/bin/rubocop", join(home, ".rbenv", "shims", "rubocop")];
     case "pmd":
       return ["pmd", "/usr/local/bin/pmd", "/opt/homebrew/bin/pmd"];
+    case "phpstan":
+      return [
+        "phpstan",
+        "/usr/local/bin/phpstan",
+        "/opt/homebrew/bin/phpstan",
+        join(home, ".composer", "vendor", "bin", "phpstan"),
+        join(home, ".config", "composer", "vendor", "bin", "phpstan"),
+        join(home, ".local", "bin", "phpstan"),
+      ];
   }
 }
 
@@ -419,6 +438,36 @@ function tryInstallQualityEngine(engine: QualityEngine): boolean {
       }
       return false;
     }
+
+    case "phpstan": {
+      const localBin = join(homedir(), ".local", "bin");
+
+      // Option 1: composer global require (best — keeps phpstan in vendor)
+      if (commandExists("composer")) {
+        console.log("     → composer global require phpstan/phpstan");
+        const r = spawnSync("composer", ["global", "require", "phpstan/phpstan", "--no-interaction"], {
+          stdio: "inherit",
+        });
+        if (r.status === 0 && isQualityEnginePresent("phpstan")) return true;
+      }
+
+      // Option 2: Download the phpstan.phar directly (no composer required)
+      if (commandExists("curl")) {
+        try {
+          mkdirSync(localBin, { recursive: true });
+          const dest = join(localBin, "phpstan");
+          console.log(`     → curl https://github.com/phpstan/phpstan/releases/latest/download/phpstan.phar`);
+          const r = spawnSync(
+            "bash",
+            ["-c", `curl -sL https://github.com/phpstan/phpstan/releases/latest/download/phpstan.phar -o "${dest}" && chmod +x "${dest}"`],
+            { stdio: "inherit" }
+          );
+          if (r.status === 0 && isQualityEnginePresent("phpstan")) return true;
+        } catch { /* ignore */ }
+      }
+
+      return false;
+    }
   }
 }
 
@@ -485,6 +534,131 @@ function installPreCommitHook(cwd: string): void {
     chmodSync(hookPath, 0o755);
     console.log("  ✓ Pre-commit hook installed");
   }
+}
+
+// ─── Credential wizard ────────────────────────────────────────────────────────
+
+async function runConfigureWizard(): Promise<void> {
+  console.log("\n🔑 argus-ci credential setup\n");
+  console.log("This wizard stores API keys in ~/.argus-ci.json (mode 600 — readable only by you).");
+  console.log("Press Enter to keep the existing value, or type a new one.\n");
+
+  const existing = loadConfig();
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+  const ask = (question: string, current?: string): Promise<string> =>
+    new Promise((resolve) => {
+      const display = current ? ` (current: ${maskToken(current)})` : "";
+      rl.question(`  ${question}${display}: `, (ans) => resolve(ans.trim()));
+    });
+
+  // ── Groq API key (free AI fix suggestions) ──────────────────────────────────
+  console.log("┌─ AI Fix Suggestions (optional) ─────────────────────────────────────────┐");
+  console.log("│ Groq is free — get a key at https://console.groq.com (signup, no credit │");
+  console.log("│ card). Used for one-line fix hints on error findings.                   │");
+  console.log("└─────────────────────────────────────────────────────────────────────────┘");
+  const groqKey = await ask("GROQ_API_KEY", existing.groqApiKey);
+  if (groqKey) {
+    process.stdout.write("  Validating Groq key... ");
+    const groqValid = await validateGroqKey(groqKey);
+    console.log(groqValid ? "✅ valid" : "⚠️  could not validate (saved anyway)");
+  }
+
+  // ── GitHub token (Dependabot alerts) ────────────────────────────────────────
+  console.log("\n┌─ GitHub Token (optional) ────────────────────────────────────────────────┐");
+  console.log("│ Enables Dependabot vulnerability alerts from your GitHub repo.           │");
+  console.log("│ Create at https://github.com/settings/tokens — needs 'security_events'  │");
+  console.log("│ read scope (classic token) or 'Dependabot alerts: Read' (fine-grained). │");
+  console.log("└─────────────────────────────────────────────────────────────────────────┘");
+  const githubToken = await ask("GITHUB_TOKEN", existing.githubToken);
+  if (githubToken) {
+    process.stdout.write("  Validating GitHub token... ");
+    const ghValid = await validateGithubToken(githubToken);
+    console.log(ghValid ? "✅ valid" : "⚠️  could not validate (saved anyway)");
+  }
+
+  // ── SonarQube / SonarCloud ────────────────────────────────────────────────
+  console.log("\n┌─ SonarQube / SonarCloud (optional) ─────────────────────────────────────┐");
+  console.log("│ Fetches open issues from your Sonar project.                            │");
+  console.log("│ SonarCloud: https://sonarcloud.io/account/security → generate token    │");
+  console.log("│ SonarQube:  <your-server>/account/security → generate token            │");
+  console.log("└─────────────────────────────────────────────────────────────────────────┘");
+  const sonarToken = await ask("SONAR_TOKEN", existing.sonarToken);
+  const sonarProjectKey = await ask("SONAR_PROJECT_KEY (e.g. myorg_myrepo)", existing.sonarProjectKey);
+  const sonarServerUrl  = await ask("SONAR_SERVER_URL  (leave blank for SonarCloud)", existing.sonarServerUrl);
+  const sonarOrg        = await ask("SONAR_ORGANIZATION (SonarCloud org slug, blank for self-hosted)", existing.sonarOrganization);
+
+  if (sonarToken && sonarProjectKey) {
+    process.stdout.write("  Validating Sonar token... ");
+    const sonarValid = await validateSonarToken(
+      sonarToken, sonarProjectKey,
+      sonarServerUrl || "https://sonarcloud.io",
+      sonarOrg || undefined
+    );
+    console.log(sonarValid ? "✅ valid" : "⚠️  could not validate (saved anyway)");
+  }
+
+  rl.close();
+
+  // Save — only overwrite fields that were provided
+  const config = { ...existing };
+  if (groqKey)         config.groqApiKey      = groqKey;
+  if (githubToken)     config.githubToken     = githubToken;
+  if (sonarToken)      config.sonarToken      = sonarToken;
+  if (sonarProjectKey) config.sonarProjectKey = sonarProjectKey;
+  if (sonarServerUrl)  config.sonarServerUrl  = sonarServerUrl;
+  if (sonarOrg)        config.sonarOrganization = sonarOrg;
+
+  saveConfig(config);
+
+  console.log("\n✅ Configuration saved to ~/.argus-ci.json");
+  console.log("\nActive passes:");
+  if (config.groqApiKey || config.anthropicApiKey) console.log("  + AI fix suggestions (Pass +AI)");
+  if (config.githubToken)     console.log("  + Dependabot alerts (Pass 5)");
+  if (config.sonarToken)      console.log("  + SonarQube/Cloud (Pass 6)");
+  console.log("\nRun `npx argus-ci check_setup` to verify the full configuration.\n");
+}
+
+function maskToken(token: string): string {
+  if (token.length <= 8) return "***";
+  return `${token.slice(0, 4)}...${token.slice(-4)}`;
+}
+
+async function validateGroqKey(key: string): Promise<boolean> {
+  try {
+    const res = await fetch("https://api.groq.com/openai/v1/models", {
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    return res.ok;
+  } catch { return false; }
+}
+
+async function validateGithubToken(token: string): Promise<boolean> {
+  try {
+    const res = await fetch("https://api.github.com/user", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+      },
+    });
+    return res.ok;
+  } catch { return false; }
+}
+
+async function validateSonarToken(
+  token: string, projectKey: string,
+  serverUrl: string, org?: string
+): Promise<boolean> {
+  try {
+    const params = new URLSearchParams({ projectKeys: projectKey, ps: "1" });
+    if (org) params.set("organization", org);
+    const res = await fetch(`${serverUrl.replace(/\/$/, "")}/api/issues/search?${params}`, {
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${token}:`).toString("base64")}`,
+      },
+    });
+    return res.ok;
+  } catch { return false; }
 }
 
 // ─── Remove ───────────────────────────────────────────────────────────────────

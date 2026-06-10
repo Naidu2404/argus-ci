@@ -1,7 +1,7 @@
 {
   "name": "argus-ci",
-  "version": "1.3.2",
-  "description": "AI-powered code security agent — MCP server for Cursor/Claude, mandatory pre-commit gate, and conversational PR/branch review",
+  "version": "2.0.0",
+  "description": "6-pass security & quality agent — Opengrep + Bearer + quality linter + ESLint/tsc + dep audit + Sonar — MCP server for Cursor/Claude + pre-commit gate",
   "type": "module",
   "main": "dist/mcp/server.js",
   "bin": {
@@ -15,8 +15,11 @@
     "prepublishOnly": "npm run build"
   },
   "keywords": [
+    "opengrep",
     "semgrep",
+    "bearer",
     "security",
+    "code-quality",
     "code-review",
     "mcp",
     "model-context-protocol",
@@ -26,8 +29,12 @@
     "static-analysis",
     "owasp",
     "vulnerability",
+    "sonarqube",
+    "dependabot",
     "agent",
-    "ai"
+    "ai",
+    "oxlint",
+    "ruff"
   ],
   "author": "Venkat Swara Moyya <venkatswaramoyya@recruitcrm.io>",
   "license": "MIT",

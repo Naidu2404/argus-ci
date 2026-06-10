@@ -112,7 +112,7 @@ export function detectRulesets(cwd: string): StackInfo {
   if (existsSync(join(cwd, "composer.json"))) {
     stackLabels.push("PHP");
     rulesets.add("p/php");
-    // no dedicated quality engine for PHP yet — Semgrep covers it
+    if (!qualityEngine) qualityEngine = "phpstan";
   }
 
   // ── Rust ──────────────────────────────────────────────────────────────────

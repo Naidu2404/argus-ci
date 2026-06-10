@@ -7,6 +7,7 @@
  *   Go     → golangci-lint (aggregates 50+ Go linters)
  *   Ruby   → RuboCop       (community standard Ruby linter)
  *   Java   → PMD           (static analysis, complexity, duplicates)
+ *   PHP    → PHPStan       (static analysis: undefined vars, wrong types, dead code)
  */
 
 import { spawnSync } from "child_process";
@@ -39,7 +40,8 @@ export async function runQualityScan(
       case "ruff":          return runRuff(files, cwd, binary, t0, isRepoScan);
       case "golangci-lint": return runGolangci(files, cwd, binary, t0);
       case "rubocop":       return runRubocop(files, cwd, binary, t0);
-      case "pmd":           return runPMD(files, cwd, binary, t0);
+      case "pmd":           return runPMD(files, cwd, binary, t0, isRepoScan);
+      case "phpstan":       return runPhpstan(files, cwd, binary, t0, isRepoScan);
       default:              return skip(`Unknown quality engine: ${engine}`, t0);
     }
   } catch (err) {
@@ -292,27 +294,134 @@ function runRubocop(files: string[], cwd: string, binary: string, t0: number): S
   };
 }
 
-// ─── PMD (Java) ───────────────────────────────────────────────────────────────
+// ─── PHPStan (PHP) ───────────────────────────────────────────────────────────
+//
+// Requires phpstan to be installed (composer global require phpstan/phpstan
+// or curl download of the .phar). Level 3 is balanced: catches undefined
+// variables, wrong types, dead code — without overwhelming noise.
 
-function runPMD(files: string[], cwd: string, binary: string, t0: number): ScanResult {
-  const result = spawnSync(
-    binary,
-    ["check", "--format", "json", "--rulesets", "rulesets/java/quickstart.xml",
-     "--dir", files.join(",")],
-    { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024, timeout: 60_000 }
-  );
+function runPhpstan(files: string[], cwd: string, binary: string, t0: number, isRepoScan = false): ScanResult {
+  // phpstan works best with a directory; for repo scans use cwd, otherwise use
+  // the unique set of directories containing the target files.
+  const targets = isRepoScan
+    ? [cwd]
+    : [...new Set(files.map((f) => {
+        const abs = f.startsWith("/") ? f : join(cwd, f);
+        // If it's a file, scan the file directly; phpstan accepts file paths too
+        return abs;
+      }))];
+
+  const args = [
+    "analyse",
+    "--error-format=json",
+    "--no-progress",
+    "--level",       "3",     // balanced level (0=loose … 9=strict)
+    "--memory-limit", "512M",
+    ...targets,
+  ];
+
+  const result = spawnSync(binary, args, {
+    cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024, timeout: 120_000,
+  });
 
   const stdout = (result.stdout ?? "").trim();
-  if (!stdout) return clean(files.length, t0, "pmd");
+  if (!stdout) return clean(files.length, t0, "phpstan");
 
-  let raw: PMDOutput;
+  let raw: PhpstanOutput;
   try {
-    raw = JSON.parse(stdout) as PMDOutput;
+    raw = JSON.parse(stdout) as PhpstanOutput;
+  } catch {
+    return skip("Failed to parse phpstan output", t0);
+  }
+
+  const issues: Issue[] = [];
+  for (const [filePath, fileData] of Object.entries(raw.files ?? {})) {
+    for (const msg of fileData.messages ?? []) {
+      const relPath = filePath.startsWith(cwd) ? filePath.slice(cwd.length + 1) : filePath;
+      issues.push({
+        ruleId:   `phpstan/${msg.identifier ?? "error"}`,
+        path:     relPath,
+        line:     msg.line,
+        col:      1,
+        severity: "warning",    // phpstan doesn't expose severity levels
+        message:  msg.message,
+        engine:   "phpstan",
+      });
+    }
+  }
+
+  return {
+    issues, skipped: false,
+    filesScanned: files.length, durationMs: Date.now() - t0,
+    rulesets: ["phpstan/level3"], engines: ["phpstan"],
+  };
+}
+
+// ─── PMD (Java) ───────────────────────────────────────────────────────────────
+//
+// PMD always scans the project directory (same pattern as golangci-lint ./...).
+// Passing individual files via --dir doesn't work reliably across PMD versions.
+//
+// JSON format changed between PMD 6 and PMD 7:
+//   PMD 6: { "violations": [{ "filename": ..., ... }] }
+//   PMD 7: { "files": [{ "filename": ..., "violations": [{ ... }] }] }
+// We handle both.
+
+function runPMD(files: string[], cwd: string, binary: string, t0: number, isRepoScan = false): ScanResult {
+  const result = spawnSync(
+    binary,
+    [
+      "check",
+      "--format",       "json",
+      "--rulesets",     "rulesets/java/quickstart.xml",
+      "--dir",          cwd,
+      "--no-cache",
+    ],
+    { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024, timeout: 120_000 }
+  );
+
+  // PMD exits 4 when violations found — treat as success
+  const stdout = (result.stdout ?? "").trim();
+  if (!stdout) {
+    // If PMD produced no output and stderr mentions unknown ruleset, try category-based
+    const stderr = (result.stderr ?? "").toLowerCase();
+    if (stderr.includes("ruleset") || stderr.includes("could not find")) {
+      return runPMDWithCategoryRulesets(files, cwd, binary, t0);
+    }
+    return clean(files.length, t0, "pmd");
+  }
+
+  let raw: PMDOutputV6 | PMDOutputV7;
+  try {
+    raw = JSON.parse(stdout) as PMDOutputV6 | PMDOutputV7;
   } catch {
     return skip("Failed to parse PMD output", t0);
   }
 
-  const issues: Issue[] = (raw.violations ?? []).map((v) => ({
+  // Normalise both PMD 6 and PMD 7 formats into a flat violation list
+  let violations: PMDViolation[];
+  if ("files" in raw && Array.isArray(raw.files)) {
+    // PMD 7: violations nested per file
+    violations = raw.files.flatMap((f) =>
+      (f.violations ?? []).map((v) => ({ ...v, filename: f.filename }))
+    );
+  } else if ("violations" in raw && Array.isArray(raw.violations)) {
+    // PMD 6: flat violations array with filename on each
+    violations = raw.violations;
+  } else {
+    violations = [];
+  }
+
+  // For targeted file scans, filter to only the requested files
+  const fileSet = new Set(files.map((f) => (f.startsWith("/") ? f : join(cwd, f))));
+  const filtered = isRepoScan
+    ? violations
+    : violations.filter((v) => {
+        const abs = v.filename.startsWith("/") ? v.filename : join(cwd, v.filename);
+        return fileSet.has(abs) || files.some((f) => abs.endsWith(f) || f.endsWith(v.filename));
+      });
+
+  const issues: Issue[] = filtered.map((v) => ({
     ruleId:   `pmd/${v.ruleset}/${v.rule}`,
     path:     v.filename,
     line:     v.beginline,
@@ -326,6 +435,51 @@ function runPMD(files: string[], cwd: string, binary: string, t0: number): ScanR
     issues, skipped: false,
     filesScanned: files.length, durationMs: Date.now() - t0,
     rulesets: ["pmd/quickstart"], engines: ["pmd"],
+  };
+}
+
+/** Fallback when quickstart.xml isn't found — use PMD 7 category rulesets */
+function runPMDWithCategoryRulesets(files: string[], cwd: string, binary: string, t0: number): ScanResult {
+  const result = spawnSync(
+    binary,
+    [
+      "check",
+      "--format",       "json",
+      "--rulesets",     "category/java/bestpractices.xml,category/java/errorprone.xml,category/java/codestyle.xml",
+      "--dir",          cwd,
+      "--no-cache",
+    ],
+    { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024, timeout: 120_000 }
+  );
+
+  const stdout = (result.stdout ?? "").trim();
+  if (!stdout) return clean(files.length, t0, "pmd");
+
+  let raw: PMDOutputV7;
+  try {
+    raw = JSON.parse(stdout) as PMDOutputV7;
+  } catch {
+    return skip("Failed to parse PMD output", t0);
+  }
+
+  const violations = (raw.files ?? []).flatMap((f) =>
+    (f.violations ?? []).map((v) => ({ ...v, filename: f.filename }))
+  );
+
+  const issues: Issue[] = violations.map((v) => ({
+    ruleId:   `pmd/${v.ruleset}/${v.rule}`,
+    path:     v.filename,
+    line:     v.beginline,
+    col:      v.begincolumn,
+    severity: mapPMDPriority(v.priority),
+    message:  v.description,
+    engine:   "pmd" as const,
+  }));
+
+  return {
+    issues, skipped: false,
+    filesScanned: files.length, durationMs: Date.now() - t0,
+    rulesets: ["pmd/category-java"], engines: ["pmd"],
   };
 }
 
@@ -375,6 +529,16 @@ function engineCandidates(engine: QualityEngine): string[] {
       return ["rubocop", "/usr/local/bin/rubocop", join(home, ".rbenv", "shims", "rubocop")];
     case "pmd":
       return ["pmd", "/usr/local/bin/pmd", "/opt/homebrew/bin/pmd"];
+    case "phpstan":
+      return [
+        "phpstan",
+        "/usr/local/bin/phpstan",
+        "/opt/homebrew/bin/phpstan",
+        join(home, ".composer", "vendor", "bin", "phpstan"),
+        join(home, ".config", "composer", "vendor", "bin", "phpstan"),
+        join(home, ".local", "bin", "phpstan"),
+        "/usr/local/lib/phpstan.phar",
+      ];
     default:
       return [];
   }
@@ -477,14 +641,44 @@ interface RubocopOutput {
   }>;
 }
 
-interface PMDOutput {
-  violations: Array<{
-    filename:    string;
-    beginline:   number;
-    begincolumn: number;
-    rule:        string;
-    ruleset:     string;
-    description: string;
-    priority:    number;
+// PMD violation shape (shared between v6 and v7)
+interface PMDViolation {
+  filename:    string;
+  beginline:   number;
+  begincolumn: number;
+  rule:        string;
+  ruleset:     string;
+  description: string;
+  priority:    number;
+}
+
+// PMD 6 — flat violations array
+interface PMDOutputV6 {
+  violations: PMDViolation[] | null;
+}
+
+// PMD 7 — violations nested under each file
+interface PMDOutputV7 {
+  pmdVersion?: string;
+  files: Array<{
+    filename:   string;
+    violations: Omit<PMDViolation, "filename">[];
   }> | null;
+  processingErrors?: unknown[];
+  configurationErrors?: unknown[];
+}
+
+// PHPStan JSON output (--error-format=json)
+interface PhpstanOutput {
+  totals?: { errors: number; file_errors: number };
+  files: Record<string, {
+    errors:   number;
+    messages: Array<{
+      message:     string;
+      line:        number;
+      ignorable?:  boolean;
+      identifier?: string;   // e.g. "function.notFound"
+    }>;
+  }> | null;
+  errors?: string[];
 }

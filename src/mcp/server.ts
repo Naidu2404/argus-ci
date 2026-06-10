@@ -1,19 +1,22 @@
 /**
- * Semgrep Agent — MCP Server
+ * argus-ci — MCP Server v2.0.0
  *
- * Exposes four tools to Cursor / Claude Code / any MCP client:
+ * Tools exposed to Cursor / Claude Code / any MCP client:
  *
- *   scan_repo    — scan entire repository (all source files, all passes)
- *   scan_files   — scan specific files (called post code-generation)
- *   scan_staged  — scan git staged files (pre-commit check)
- *   scan_branch  — scan changed files on a branch vs base
- *   scan_pr      — scan a GitHub PR by URL
+ *   scan_repo         — full repo scan (6 passes: security + quality + deps + sonar)
+ *   scan_files        — scan specific files (post code-generation)
+ *   scan_staged       — scan git staged files (pre-commit check)
+ *   scan_branch       — scan changed files on a branch vs base
+ *   scan_pr           — scan a GitHub PR by URL
+ *   find_trace_code   — find console.log / debugger / TODOs in source files
+ *   remove_trace_code — auto-remove safe trace items (console/debugger)
+ *   check_setup       — show which tools/tokens are configured
  *
  * Add to Cursor: Settings → MCP → add entry:
  *   { "command": "npx", "args": ["argus-ci"] }
  *
  * Add to Claude Code (~/.claude/settings.json):
- *   { "mcpServers": { "semgrep": { "command": "npx", "args": ["argus-ci"] } } }
+ *   { "mcpServers": { "argus-ci": { "command": "npx", "args": ["argus-ci"] } } }
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -23,10 +26,12 @@ import { scanFiles, scanStaged, scanBranch, scanRepo } from "../core/scanner.js"
 import { fetchPRFiles, postPRComment } from "../core/github.js";
 import { detectRulesets } from "../core/detector.js";
 import { toMarkdown, toPRComment } from "../core/reporter.js";
+import { scanForTraceCode, removeTraceItems } from "../core/trace.js";
+import { getConfigStatus } from "../core/config.js";
 
 const server = new McpServer({
-  name:    "argus",
-  version: "1.0.0",
+  name:    "argus-ci",
+  version: "2.0.0",
 });
 
 // ─── Tool: scan_files ─────────────────────────────────────────────────────────
@@ -221,6 +226,156 @@ server.tool(
       content: [{ type: "text" as const, text: markdown }],
       isError: hasErrors,
     };
+  }
+);
+
+// ─── Tool: find_trace_code ────────────────────────────────────────────────────
+
+server.tool(
+  "find_trace_code",
+  "Find debug artifacts left in source code: console.log/warn/error, debugger statements, " +
+  "TODO/FIXME/HACK comments, and commented-out code blocks. " +
+  "Run this before committing to keep the codebase clean.",
+  {
+    files: z.array(z.string()).describe(
+      "File paths to scan for trace code (relative to cwd or absolute)"
+    ),
+    cwd: z.string().optional().describe(
+      "Working directory / repo root. Defaults to process.cwd()"
+    ),
+  },
+  async ({ files, cwd }) => {
+    const workdir = cwd ?? process.cwd();
+    const result  = scanForTraceCode(files, workdir);
+
+    if (result.items.length === 0) {
+      return {
+        content: [{ type: "text" as const, text: `✅ No trace code found in ${result.filesScanned} file${result.filesScanned !== 1 ? "s" : ""}.` }],
+      };
+    }
+
+    const lines: string[] = [
+      `## 🔎 Trace code found — ${result.items.length} items in ${result.filesScanned} files`,
+      ``,
+      `| | Count |`,
+      `|---|---|`,
+      `| ✅ Safe to auto-remove | ${result.safeCount} |`,
+      `| ⚠️  Needs review        | ${result.reviewCount} |`,
+      ``,
+    ];
+
+    const byFile = new Map<string, typeof result.items>();
+    for (const item of result.items) {
+      (byFile.get(item.path) ?? byFile.set(item.path, []).get(item.path))!.push(item);
+    }
+
+    for (const [file, items] of byFile) {
+      lines.push(`### \`${file}\``);
+      for (const item of items) {
+        const icon = item.safeToRemove ? "✅" : "⚠️";
+        lines.push(`- ${icon} **${item.kind}** line ${item.line}: \`${item.sourceLine.slice(0, 80)}\``);
+        if (item.removeNote) lines.push(`  > ${item.removeNote}`);
+      }
+      lines.push("");
+    }
+
+    lines.push(`_Use \`remove_trace_code\` to auto-remove the ✅ safe items._`);
+
+    return {
+      content: [{ type: "text" as const, text: lines.join("\n") }],
+    };
+  }
+);
+
+// ─── Tool: remove_trace_code ──────────────────────────────────────────────────
+
+server.tool(
+  "remove_trace_code",
+  "Automatically remove safe trace code (console.log, debugger) from source files. " +
+  "Items requiring review (TODOs, commented-out code) are NOT removed automatically — " +
+  "only removed if you explicitly set remove_all=true.",
+  {
+    files: z.array(z.string()).describe(
+      "File paths to scan and clean (relative to cwd or absolute)"
+    ),
+    cwd: z.string().optional().describe(
+      "Working directory / repo root. Defaults to process.cwd()"
+    ),
+    remove_all: z.boolean().optional().default(false).describe(
+      "If true, also removes TODOs and commented-out code blocks (use with caution)"
+    ),
+  },
+  async ({ files, cwd, remove_all }) => {
+    const workdir = cwd ?? process.cwd();
+    const scan    = scanForTraceCode(files, workdir);
+
+    if (scan.items.length === 0) {
+      return {
+        content: [{ type: "text" as const, text: `✅ No trace code found — nothing to remove.` }],
+      };
+    }
+
+    const { removed, skipped, errors } = removeTraceItems(scan.items, workdir, !remove_all);
+
+    const lines: string[] = [`## 🧹 Trace code removal complete`];
+    lines.push(``, `✅ Removed: ${removed}`, `⏭ Skipped (line changed): ${skipped}`);
+    if (errors.length) {
+      lines.push(``, `⚠️ Errors:`);
+      for (const e of errors) lines.push(`  - ${e}`);
+    }
+    if (scan.reviewCount > 0 && !remove_all) {
+      lines.push(``, `_ℹ️ ${scan.reviewCount} items need manual review (TODOs, commented code) — set remove_all=true to force remove them._`);
+    }
+
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+  }
+);
+
+// ─── Tool: check_setup ────────────────────────────────────────────────────────
+
+server.tool(
+  "check_setup",
+  "Show the current argus-ci configuration: which scanners are installed, " +
+  "which API tokens are set, and what passes are enabled. " +
+  "Run this when troubleshooting or to confirm setup is complete.",
+  {
+    cwd: z.string().optional().describe("Repo root to check. Defaults to process.cwd()"),
+  },
+  async ({ cwd }) => {
+    const workdir = cwd ?? process.cwd();
+    const status  = getConfigStatus();
+    const stack   = detectRulesets(workdir);
+
+    const lines: string[] = [
+      `## ⚙️ argus-ci setup status`,
+      ``,
+      `**Detected stack:** ${stack.stack.join(", ") || "none"}`,
+      `**Quality engine:** ${stack.qualityEngine ?? "none"}`,
+      ``,
+      `### API tokens`,
+      `| Token | Status |`,
+      `|---|---|`,
+      `| GROQ_API_KEY      | ${status.groq      ? "✅ set" : "❌ not set (optional — AI fix suggestions)"} |`,
+      `| ANTHROPIC_API_KEY | ${status.anthropic  ? "✅ set" : "❌ not set (optional — AI fix suggestions)"} |`,
+      `| GITHUB_TOKEN      | ${status.github     ? "✅ set" : "❌ not set (optional — Dependabot alerts)"} |`,
+      `| SONAR_TOKEN       | ${status.sonar      ? "✅ set" : "❌ not set (optional — SonarQube/Cloud)"} |`,
+      `| SONAR_PROJECT_KEY | ${status.sonarProject ? "✅ set" : "❌ not set (optional)"} |`,
+      ``,
+      `### Passes enabled`,
+      `| Pass | Tool | Status |`,
+      `|---|---|---|`,
+      `| 1 Security   | Opengrep/Semgrep | always runs |`,
+      `| 2 Data-flow  | Bearer           | runs if installed |`,
+      `| 3 Quality    | ${stack.qualityEngine ?? "none"} | ${stack.qualityEngine ? "runs if installed" : "no engine detected"} |`,
+      `| 4 Project    | ESLint+tsc+Prettier | runs if repo config found |`,
+      `| 5 Deps       | npm/pip/bundler/cargo audit + Dependabot | runs if manifest found |`,
+      `| 6 Sonar      | SonarQube/Cloud  | ${status.sonar ? "✅ enabled" : "❌ requires SONAR_TOKEN"} |`,
+      `| + AI         | Groq/Anthropic   | ${(status.groq || status.anthropic) ? "✅ enabled" : "❌ requires API key"} |`,
+      ``,
+      `_Run \`npx argus-ci setup --configure\` to add missing tokens._`,
+    ];
+
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
   }
 );
 

@@ -6,3 +6,4 @@ dist/
 .env.local
 .code-patrol.json
 npm-debug.log*
+.DS_Store

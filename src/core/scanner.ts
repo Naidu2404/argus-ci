@@ -1,23 +1,30 @@
 /**
- * Scanner core — three-pass analysis:
+ * Scanner core — six-pass analysis:
  *
  *   1. Opengrep / Semgrep  — security patterns + OWASP + secrets (always)
- *   2. Bearer              — deep data-flow security (staged/branch/PR)
- *   3. Quality engine      — language-specific linter: Oxlint / Ruff /
- *                            golangci-lint / RuboCop / PMD (staged/branch/PR)
+ *   2. Bearer              — deep data-flow security (staged/branch/PR/repo)
+ *   3. Quality engine      — Oxlint / Ruff / golangci-lint / RuboCop / PMD / PHPStan
+ *   4. Project checks      — ESLint (repo config) + tsc --noEmit + Prettier
+ *   5. Dependency audit    — npm audit / pip-audit / bundler-audit + Dependabot
+ *   6. Sonar               — SonarQube / SonarCloud (requires SONAR_TOKEN)
+ *   +  AI enrichment       — optional fix suggestions via Groq / Anthropic
  */
 
-import { execSync, spawnSync } from "child_process";
-import { existsSync, readFileSync, statSync } from "fs";
-import { join } from "path";
-import { homedir } from "os";
+import { execSync, spawnSync }       from "child_process";
+import { existsSync, statSync }      from "fs";
+import { join }                      from "path";
+import { homedir }                   from "os";
 import type {
   Issue, ScanConfig, ScanResult, ScanEngine,
   SemgrepFinding, SemgrepRawResult,
   BearerRawResult, BearerFinding,
 } from "../types.js";
-import { detectRulesets } from "./detector.js";
+import { detectRulesets }            from "./detector.js";
 import { runQualityScan, isQualityEngineInstalled } from "./quality.js";
+import { runProjectChecks }          from "./project.js";
+import { runDepsCheck }              from "./deps.js";
+import { runSonarCheck }             from "./sonar.js";
+import { enrichWithAI }              from "./ai.js";
 
 const DEFAULT_RULESETS = ["p/secrets", "p/owasp-top-ten", "p/security-audit"];
 const DEFAULT_EXCLUDE  = ["node_modules", "dist", ".git", "coverage", "build", ".next", "vendor"];
@@ -29,7 +36,7 @@ export async function scanFiles(
   cwd:    string,
   config: ScanConfig = {}
 ): Promise<ScanResult> {
-  const t0 = Date.now();
+  const t0       = Date.now();
   const eligible = filterEligible(files, cwd, config);
   if (eligible.length === 0) return empty("No eligible files to scan", t0, config);
   return scanFilesInternal(eligible, cwd, config, t0);
@@ -41,101 +48,109 @@ async function scanFilesInternal(
   config: ScanConfig,
   t0:     number
 ): Promise<ScanResult> {
-  // Pass 1: Opengrep / Semgrep — security patterns (always)
-  const primaryResult = await runPrimaryScanner(files, cwd, config, t0);
+  const results: ScanResult[] = [];
+  const isRepoScan = config._isRepoScan ?? false;
+  const stackInfo  = detectRulesets(cwd);
 
-  // Pass 2: Bearer — deep data-flow (skip for single-file calls — too slow)
-  const runBearer  = config.runBearer  ?? (files.length > 1);
-  // Pass 3: Quality linter — always run (fast Rust-based tools)
-  const runQuality = config.runQuality ?? true;
+  // Pass 1: Opengrep / Semgrep — always
+  results.push(await runPrimaryScanner(files, cwd, config, t0));
 
-  const results: ScanResult[] = [primaryResult];
-
-  if (runBearer && isBearerInstalled()) {
+  // Pass 2: Bearer — deep data-flow (skip for single-file calls)
+  if ((config.runBearer ?? (files.length > 1)) && isBearerInstalled()) {
     results.push(await runBearerScan(files, cwd, t0));
   }
 
-  if (runQuality) {
-    const stackInfo = detectRulesets(cwd);
-    const engine    = config.qualityEngine ?? stackInfo.qualityEngine;
+  // Pass 3: Quality engine (Oxlint / Ruff / golangci-lint / RuboCop / PMD / PHPStan)
+  if (config.runQuality ?? true) {
+    const engine = config.qualityEngine ?? stackInfo.qualityEngine;
     if (engine && isQualityEngineInstalled(engine)) {
-      // For large repo scans, tell quality engine to use directory mode (faster, avoids arg-length limits)
-      const isRepoScan = config._isRepoScan ?? false;
       results.push(await runQualityScan(files, cwd, engine, t0, isRepoScan));
     }
   }
 
-  return results.length === 1 ? results[0]! : mergeAll(results, t0);
+  // Pass 4: Project checks (ESLint + tsc + Prettier using repo's own config)
+  if (config.runProject ?? true) {
+    results.push(await runProjectChecks(files, cwd, t0, isRepoScan));
+  }
+
+  // Pass 5: Dependency audit — only on multi-file or repo scans
+  if (config.runDeps ?? (files.length > 1 || isRepoScan)) {
+    results.push(await runDepsCheck(cwd, t0));
+  }
+
+  // Pass 6: SonarQube / SonarCloud (skips silently if token not configured)
+  if (config.runSonar ?? true) {
+    results.push(await runSonarCheck(files, cwd, t0, isRepoScan));
+  }
+
+  let merged = results.length === 1 ? results[0]! : mergeAll(results, t0);
+
+  // AI enrichment — optional, adds fixSuggestion to error-level findings
+  if (config.runAI ?? true) {
+    merged = await enrichWithAI(merged);
+  }
+
+  return merged;
 }
 
 export async function scanStaged(cwd: string, config: ScanConfig = {}): Promise<ScanResult> {
   let staged: string[];
   try {
     const out = execSync("git diff --name-only --cached --diff-filter=ACM", { cwd, encoding: "utf8" });
-    staged = out.trim().split("\n").filter(Boolean);
+    staged    = out.trim().split("\n").filter(Boolean);
   } catch {
     return empty("Not a git repository or no staged files", Date.now(), config);
   }
 
-  if (staged.length === 0) {
-    return empty("No staged files", Date.now(), config);
-  }
+  if (staged.length === 0) return empty("No staged files", Date.now(), config);
 
-  // Pre-commit gate: run Bearer + quality linter (worth the extra seconds)
   return scanFiles(staged, cwd, {
     ...config,
     runBearer:  config.runBearer  ?? true,
     runQuality: config.runQuality ?? true,
+    runProject: config.runProject ?? true,
+    runDeps:    config.runDeps    ?? true,
+    runSonar:   config.runSonar   ?? true,
   });
 }
 
-/** Source file extensions to include in repo scans */
+/** Source extensions included in repo scans */
 const SOURCE_EXTENSIONS = new Set([
   "ts", "tsx", "js", "jsx", "mjs", "cjs", "vue", "svelte",
-  "py", "pyi",
-  "go",
+  "py", "pyi", "go",
   "java", "kt", "kts", "groovy",
-  "rb",
-  "php",
+  "rb", "php",
   "sh", "bash",
   "json", "yaml", "yml", "toml",
   "html", "htm",
-  "tf", "hcl",      // Terraform
-  "sql",
+  "tf", "hcl", "sql",
+  "cs", "cpp", "c", "swift", "rs",
 ]);
 
-/** Scan the entire repository — all tracked source files in one pass */
 export async function scanRepo(cwd: string, config: ScanConfig = {}): Promise<ScanResult> {
   const t0 = Date.now();
 
-  // Collect all git-tracked source files
   let allFiles: string[];
   try {
     const out = execSync("git ls-files --cached", { cwd, encoding: "utf8" });
-    allFiles = out.trim().split("\n").filter(Boolean);
+    allFiles  = out.trim().split("\n").filter(Boolean);
   } catch {
-    return empty(
-      "scan_repo requires a git repository. Navigate to the repo root and try again.",
-      t0, config
-    );
+    return empty("scan_repo requires a git repository. Navigate to the repo root and try again.", t0, config);
   }
 
-  // Keep only source code files (skip images, fonts, lock files, etc.)
   const sourceFiles = allFiles.filter((f) => {
     const ext = f.split(".").pop()?.toLowerCase() ?? "";
     return SOURCE_EXTENSIONS.has(ext);
   });
 
-  if (sourceFiles.length === 0) {
-    return empty("No source files found in repository.", t0, config);
-  }
+  if (sourceFiles.length === 0) return empty("No source files found in repository.", t0, config);
 
-  // For repo scans always run all three passes
   return scanFilesInternal(sourceFiles, cwd, {
     ...config,
-    runBearer:  config.runBearer  ?? true,
-    runQuality: config.runQuality ?? true,
-    _isRepoScan: true,       // hint for quality engine to use directory mode
+    runBearer:  true, runQuality: true,
+    runProject: true, runDeps:    true,
+    runSonar:   true, runAI:      true,
+    _isRepoScan: true,
   }, t0);
 }
 
@@ -164,47 +179,38 @@ export async function scanBranch(
     }
   }
 
-  if (files.length === 0) {
-    return empty(`No changed files between ${base} and ${branch}`, Date.now(), config);
-  }
+  if (files.length === 0) return empty(`No changed files between ${base} and ${branch}`, Date.now(), config);
 
   return scanFiles(files, cwd, {
     ...config,
-    runBearer:  config.runBearer  ?? true,
-    runQuality: config.runQuality ?? true,
+    runBearer: true, runQuality: true,
+    runProject: true, runDeps: true, runSonar: true,
   });
 }
 
 // ─── Primary scanner (Opengrep / Semgrep) ────────────────────────────────────
 
 async function runPrimaryScanner(
-  files:  string[],
-  cwd:    string,
-  config: ScanConfig,
-  t0:     number
+  files:  string[], cwd: string, config: ScanConfig, t0: number
 ): Promise<ScanResult> {
   const scannerInfo = findPrimaryScanner();
   if (!scannerInfo) {
     return {
       issues: [], skipped: true, filesScanned: files.length, durationMs: Date.now() - t0,
       rulesets: [], engines: [],
-      skipReason:
-        "No scanner found. Install Opengrep (pip install opengrep) or Semgrep (brew install semgrep)",
+      skipReason: "No scanner found. Run `npx argus-ci setup` to install Opengrep.",
     };
   }
 
   const { binary, engine } = scannerInfo;
-  const rulesets  = config.rulesets ?? DEFAULT_RULESETS;
-  const excludes  = [...DEFAULT_EXCLUDE, ...(config.exclude ?? [])];
+  const rulesets = config.rulesets ?? DEFAULT_RULESETS;
+  const excludes = [...DEFAULT_EXCLUDE, ...(config.exclude ?? [])];
 
   const args: string[] = [
     ...rulesets.flatMap((r) => ["--config", r]),
-    "--json",
-    "--no-git-ignore",
-    "--quiet",
+    "--json", "--no-git-ignore", "--quiet",
     ...excludes.flatMap((e) => ["--exclude", e]),
-    "--",
-    ...files,
+    "--", ...files,
   ];
 
   const result = spawnSync(binary, args, {
@@ -220,111 +226,68 @@ async function runPrimaryScanner(
   }
 
   let raw: SemgrepRawResult;
-  try {
-    raw = JSON.parse(result.stdout ?? "") as SemgrepRawResult;
-  } catch {
+  try { raw = JSON.parse(result.stdout ?? "") as SemgrepRawResult; }
+  catch {
     return {
       issues: [], skipped: true, filesScanned: files.length, durationMs: Date.now() - t0,
-      rulesets, engines: [],
-      skipReason: `Failed to parse ${engine} output`,
+      rulesets, engines: [], skipReason: `Failed to parse ${engine} output`,
     };
   }
 
-  const issues = raw.results.map((f) => mapSemgrepFinding(f, engine));
-
   return {
-    issues,
-    skipped: false,
-    filesScanned: files.length,
-    durationMs: Date.now() - t0,
-    rulesets,
-    engines: [engine],
+    issues: raw.results.map((f) => mapSemgrepFinding(f, engine)),
+    skipped: false, filesScanned: files.length, durationMs: Date.now() - t0,
+    rulesets, engines: [engine],
   };
 }
 
 // ─── Bearer scanner ───────────────────────────────────────────────────────────
 
-async function runBearerScan(
-  files: string[],
-  cwd:   string,
-  t0:    number
-): Promise<ScanResult> {
+async function runBearerScan(files: string[], cwd: string, t0: number): Promise<ScanResult> {
   const bearerBin = findBearer();
   if (!bearerBin) return empty("Bearer not installed", t0, {});
 
-  // Bearer scans paths/directories — deduplicate to unique directories containing the files
-  const paths = [...new Set(files.map((f) => {
-    const abs = f.startsWith("/") ? f : join(cwd, f);
-    return abs;
-  }))];
+  const paths = [...new Set(files.map((f) => f.startsWith("/") ? f : join(cwd, f)))];
+  const result = spawnSync(
+    bearerBin, ["scan", "--format", "json", "--quiet", "--exit-code", "0", ...paths],
+    { cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024, timeout: 60_000 }
+  );
 
-  const args = [
-    "scan",
-    "--format", "json",
-    "--quiet",
-    "--exit-code", "0",   // don't exit 1 on findings — we handle them ourselves
-    ...paths,
-  ];
-
-  const result = spawnSync(bearerBin, args, {
-    cwd, encoding: "utf8", maxBuffer: 50 * 1024 * 1024, timeout: 60_000,
-  });
-
-  if (result.status !== 0) {
-    return empty(`Bearer scan failed (exit ${result.status})`, t0, {});
-  }
+  if (result.status !== 0) return empty(`Bearer scan failed (exit ${result.status})`, t0, {});
 
   let raw: BearerRawResult;
-  try {
-    raw = JSON.parse(result.stdout ?? "") as BearerRawResult;
-  } catch {
-    return empty("Failed to parse Bearer output", t0, {});
-  }
+  try { raw = JSON.parse(result.stdout ?? "") as BearerRawResult; }
+  catch { return empty("Failed to parse Bearer output", t0, {}); }
 
   const issues: Issue[] = [];
-  const severityMap: Record<string, Issue["severity"]> = {
-    critical: "error",
-    high:     "error",
-    medium:   "warning",
-    low:      "info",
-    warning:  "info",
+  const sMap: Record<string, Issue["severity"]> = {
+    critical: "error", high: "error", medium: "warning", low: "info", warning: "info",
   };
 
   for (const [sev, findings] of Object.entries(raw)) {
     if (!Array.isArray(findings)) continue;
     for (const f of findings as BearerFinding[]) {
-      // Only include files we were asked to scan
-      const relPath = f.filename.startsWith(cwd) ? f.filename.slice(cwd.length + 1) : f.filename;
+      const relPath  = f.filename.startsWith(cwd) ? f.filename.slice(cwd.length + 1) : f.filename;
       const included = files.some((file) => relPath.endsWith(file) || file.endsWith(relPath));
       if (!included) continue;
-
       issues.push({
-        ruleId:     `bearer/${f.rule_id}`,
-        path:       relPath,
-        line:       f.line_number,
-        col:        f.column_number ?? 1,
-        severity:   severityMap[sev] ?? "warning",
-        message:    f.description,
-        sourceLine: f.code_extract?.trim(),
-        cwe:        f.cwe_ids,
-        engine:     "bearer",
+        ruleId: `bearer/${f.rule_id}`, path: relPath,
+        line: f.line_number, col: f.column_number ?? 1,
+        severity: sMap[sev] ?? "warning",
+        message: f.description, sourceLine: f.code_extract?.trim(),
+        cwe: f.cwe_ids, engine: "bearer",
       });
     }
   }
 
   return {
-    issues,
-    skipped:      false,
-    filesScanned: files.length,
-    durationMs:   Date.now() - t0,
-    rulesets:     ["bearer/built-in"],
-    engines:      ["bearer"],
+    issues, skipped: false, filesScanned: files.length, durationMs: Date.now() - t0,
+    rulesets: ["bearer/built-in"], engines: ["bearer"],
   };
 }
 
 // ─── Merge results ────────────────────────────────────────────────────────────
 
-/** Merge any number of ScanResults, deduplicating by path:line:ruleId */
 function mergeAll(results: ScanResult[], t0: number): ScanResult {
   const seen    = new Set<string>();
   const deduped: Issue[] = [];
@@ -332,10 +295,7 @@ function mergeAll(results: ScanResult[], t0: number): ScanResult {
   for (const r of results) {
     for (const issue of r.issues) {
       const key = `${issue.path}:${issue.line}:${issue.ruleId}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        deduped.push(issue);
-      }
+      if (!seen.has(key)) { seen.add(key); deduped.push(issue); }
     }
   }
 
@@ -354,46 +314,33 @@ function mergeAll(results: ScanResult[], t0: number): ScanResult {
 
 function findPrimaryScanner(): { binary: string; engine: ScanEngine } | null {
   const home = homedir();
-
-  // Try opengrep first — has free taint analysis
-  // Checks system PATH, Homebrew, and official install location (~/.opengrep/cli/latest/opengrep)
-  const opengrepCandidates = [
-    "opengrep",
-    "/usr/local/bin/opengrep",
-    "/opt/homebrew/bin/opengrep",
+  const opengrep = [
+    "opengrep", "/usr/local/bin/opengrep", "/opt/homebrew/bin/opengrep",
     join(home, ".opengrep", "cli", "latest", "opengrep"),
     join(home, ".opengrep", "bin", "opengrep"),
-    join(home, ".opengrep", "opengrep"),
     join(home, ".local", "bin", "opengrep"),
   ];
-  for (const candidate of opengrepCandidates) {
-    const r = spawnSync(candidate, ["--version"], { encoding: "utf8" });
-    if (r.status === 0) return { binary: candidate, engine: "opengrep" };
+  for (const c of opengrep) {
+    const r = spawnSync(c, ["--version"], { encoding: "utf8" });
+    if (r.status === 0) return { binary: c, engine: "opengrep" };
   }
-
-  // Fall back to semgrep
-  for (const candidate of ["semgrep", "/usr/local/bin/semgrep", "/opt/homebrew/bin/semgrep"]) {
-    const r = spawnSync(candidate, ["--version"], { encoding: "utf8" });
-    if (r.status === 0) return { binary: candidate, engine: "semgrep" };
+  for (const c of ["semgrep", "/usr/local/bin/semgrep", "/opt/homebrew/bin/semgrep"]) {
+    const r = spawnSync(c, ["--version"], { encoding: "utf8" });
+    if (r.status === 0) return { binary: c, engine: "semgrep" };
   }
-
-  // Try python module form
-  for (const [prog, mod, eng] of [["python3", "opengrep", "opengrep"], ["python3", "semgrep", "semgrep"]] as const) {
+  for (const [prog, mod, eng] of [["python3","opengrep","opengrep"],["python3","semgrep","semgrep"]] as const) {
     const r = spawnSync(prog, ["-m", mod, "--version"], { encoding: "utf8" });
     if (r.status === 0) return { binary: `${prog} -m ${mod}`, engine: eng as ScanEngine };
   }
-
   return null;
 }
 
-export function isBearerInstalled(): boolean {
-  return !!findBearer();
-}
+export function isBearerInstalled(): boolean { return !!findBearer(); }
 
 function findBearer(): string | null {
-  for (const candidate of ["bearer", "/usr/local/bin/bearer", "/opt/homebrew/bin/bearer"]) {
-    const r = spawnSync(candidate, ["version"], { encoding: "utf8" });
-    if (r.status === 0) return candidate;
+  for (const c of ["bearer", "/usr/local/bin/bearer", "/opt/homebrew/bin/bearer"]) {
+    const r = spawnSync(c, ["version"], { encoding: "utf8" });
+    if (r.status === 0) return c;
   }
   return null;
 }
@@ -419,24 +366,15 @@ function empty(reason: string, t0: number, config: ScanConfig): ScanResult {
 
 function mapSemgrepFinding(f: SemgrepFinding, engine: ScanEngine): Issue {
   return {
-    ruleId:     f.check_id,
-    path:       f.path,
-    line:       f.start.line,
-    col:        f.start.col,
-    severity:   mapSemgrepSeverity(f.extra.severity),
-    message:    f.extra.message,
-    sourceLine: f.extra.lines?.trim(),
-    cwe:        toStringArray(f.extra.metadata?.cwe),
-    owasp:      toStringArray(f.extra.metadata?.owasp),
+    ruleId: f.check_id, path: f.path,
+    line: f.start.line, col: f.start.col,
+    severity: f.extra.severity === "ERROR" ? "error" : f.extra.severity === "WARNING" ? "warning" : "info",
+    message: f.extra.message, sourceLine: f.extra.lines?.trim(),
+    cwe:   toStringArray(f.extra.metadata?.cwe),
+    owasp: toStringArray(f.extra.metadata?.owasp),
     references: toStringArray(f.extra.metadata?.references),
     engine,
   };
-}
-
-function mapSemgrepSeverity(s: SemgrepFinding["extra"]["severity"]): Issue["severity"] {
-  if (s === "ERROR")   return "error";
-  if (s === "WARNING") return "warning";
-  return "info";
 }
 
 function toStringArray(val: unknown): string[] | undefined {
