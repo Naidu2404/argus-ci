@@ -1,23 +1,26 @@
 /**
  * Formats ScanResult into human-readable markdown or compact text.
- * v2.0.0 — grouped by engine, shows AI fix suggestions, per-engine stats.
+ *
+ * Two display modes — chosen automatically:
+ *   Brief   (issues > 50 or files > 20) — summary + per-engine table + top security issues
+ *   Detailed (small / targeted scans)   — per-file, per-issue with source line + fix hint
  */
 
 import type { Issue, ScanResult, Severity, ScanEngine } from "../types.js";
 
-const SEVERITY_EMOJI: Record<Severity, string> = {
-  error:   "🔴",
-  warning: "🟡",
-  info:    "🔵",
+const BRIEF_THRESHOLD_ISSUES = 50;
+const BRIEF_THRESHOLD_FILES  = 20;
+
+// Priority order for engines in output (security first, deps second, quality last)
+const ENGINE_PRIORITY: Partial<Record<ScanEngine, number>> = {
+  "opengrep": 1, "semgrep": 1, "bearer": 2,
+  "dependabot": 3, "npm-audit": 4, "pip-audit": 4, "bundler-audit": 4, "cargo-audit": 4,
+  "sonar": 5,
+  "oxlint": 6, "ruff": 6, "golangci-lint": 6, "rubocop": 6, "pmd": 6, "phpstan": 6,
+  "eslint": 7, "tsc": 8, "prettier": 9,
 };
 
-const SEVERITY_LABEL: Record<Severity, string> = {
-  error:   "ERROR",
-  warning: "WARNING",
-  info:    "INFO",
-};
-
-const ENGINE_LABEL: Partial<Record<ScanEngine, string>> = {
+export const ENGINE_LABEL: Partial<Record<ScanEngine, string>> = {
   "opengrep":      "Opengrep (security)",
   "semgrep":       "Semgrep (security)",
   "bearer":        "Bearer (data-flow)",
@@ -39,117 +42,203 @@ const ENGINE_LABEL: Partial<Record<ScanEngine, string>> = {
   "ai":            "AI suggestions",
 };
 
+const SEVERITY_EMOJI: Record<Severity, string> = { error: "🔴", warning: "🟡", info: "🔵" };
+const SEVERITY_LABEL: Record<Severity, string> = { error: "ERROR", warning: "WARNING", info: "INFO" };
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export function toMarkdown(result: ScanResult, context?: string): string {
   if (result.skipped) {
-    return `> ⚠️ Scan skipped: ${result.skipReason ?? "unknown reason"}`;
+    return `> ⚠️ ${result.skipReason ?? "Scan skipped"}`;
   }
 
-  const { issues, filesScanned, durationMs } = result;
-  const errors   = issues.filter((i) => i.severity === "error");
-  const warnings = issues.filter((i) => i.severity === "warning");
-  const infos    = issues.filter((i) => i.severity === "info");
+  const { issues, filesScanned } = result;
 
-  const lines: string[] = [];
-  const header = context ? `## 🔍 argus-ci — ${context}` : `## 🔍 argus-ci scan results`;
-  lines.push(header, "");
-
-  // ── Summary ─────────────────────────────────────────────────────────────────
   if (issues.length === 0) {
-    lines.push(
-      `✅ **No issues found** — ${filesScanned} file${filesScanned !== 1 ? "s" : ""} scanned in ${durationMs}ms`,
+    return [
+      `## 🔍 argus-ci${context ? ` — ${context}` : ""}`,
       ``,
-      `_Engines: ${result.engines.map((e) => ENGINE_LABEL[e] ?? e).join(" · ")}_`
-    );
-    return lines.join("\n");
+      `✅ **No issues found** — ${filesScanned} file${filesScanned !== 1 ? "s" : ""} scanned in ${result.durationMs}ms`,
+      `_Engines: ${result.engines.map((e) => ENGINE_LABEL[e] ?? e).join(" · ")}_`,
+    ].join("\n");
   }
 
-  // Summary table
-  lines.push(
-    `| | Count |`,
-    `|---|---|`,
-    `| 🔴 Errors   | **${errors.length}**   |`,
-    `| 🟡 Warnings | **${warnings.length}** |`,
-    `| 🔵 Info     | ${infos.length}    |`,
-    `| 📁 Files    | ${filesScanned}    |`,
-    `| ⏱ Duration  | ${durationMs}ms    |`,
-    ``
-  );
+  // Choose display mode based on scale
+  const useBrief =
+    issues.length > BRIEF_THRESHOLD_ISSUES ||
+    filesScanned > BRIEF_THRESHOLD_FILES;
 
-  // Per-engine breakdown
-  const byEngine = groupByEngine(issues);
-  if (Object.keys(byEngine).length > 1) {
-    lines.push("**Issues by engine:**");
-    for (const [eng, eIssues] of Object.entries(byEngine)) {
-      const eErrors = eIssues.filter((i) => i.severity === "error").length;
-      const eWarns  = eIssues.filter((i) => i.severity === "warning").length;
-      const label   = ENGINE_LABEL[eng as ScanEngine] ?? eng;
-      lines.push(`  - ${label}: ${eErrors > 0 ? `${eErrors} errors` : ""}${eErrors > 0 && eWarns > 0 ? ", " : ""}${eWarns > 0 ? `${eWarns} warnings` : ""}`);
-    }
-    lines.push("");
-  }
-
-  // ── Issues by engine > file ──────────────────────────────────────────────────
-  for (const [eng, engineIssues] of Object.entries(byEngine)) {
-    const label = ENGINE_LABEL[eng as ScanEngine] ?? eng;
-    lines.push(`### ${label}`);
-    lines.push("");
-
-    const byFile = groupByFile(engineIssues);
-    for (const [file, fileIssues] of Object.entries(byFile)) {
-      lines.push(`#### \`${file}\``);
-      for (const issue of fileIssues) {
-        const emoji = SEVERITY_EMOJI[issue.severity];
-        const label = SEVERITY_LABEL[issue.severity];
-        lines.push(``, `**${emoji} ${label}** — Line ${issue.line}`);
-        lines.push(`> ${issue.message}`);
-        if (issue.sourceLine) {
-          lines.push(`\`\`\`\n${issue.sourceLine}\n\`\`\``);
-        }
-        lines.push(`_Rule: \`${issue.ruleId}\`_`);
-        if (issue.cwe?.length)          lines.push(`_CWE: ${issue.cwe.join(", ")}_`);
-        if (issue.owasp?.length)        lines.push(`_OWASP: ${issue.owasp.join(", ")}_`);
-        if (issue.fixSuggestion)        lines.push(`\n💡 **Fix:** ${issue.fixSuggestion}`);
-        if (issue.references?.length)   lines.push(`_Refs: ${issue.references.slice(0,3).join(", ")}_`);
-      }
-      lines.push("");
-    }
-  }
-
-  return lines.join("\n");
+  return useBrief
+    ? toBriefMarkdown(result, context)
+    : toDetailedMarkdown(result, context);
 }
 
 export function toCompact(result: ScanResult): string {
   if (result.skipped) return `SKIPPED: ${result.skipReason}`;
   if (result.issues.length === 0) return `CLEAN — ${result.filesScanned} files scanned`;
-
   const errors = result.issues.filter((i) => i.severity === "error").length;
   const warns  = result.issues.filter((i) => i.severity === "warning").length;
-  const engStr = result.engines.map((e) => ENGINE_LABEL[e] ?? e).join(", ");
-  return `FOUND ${result.issues.length} issues (${errors} errors, ${warns} warnings) in ${result.filesScanned} files via ${engStr}`;
+  return `FOUND ${result.issues.length} issues (${errors} errors, ${warns} warnings) in ${result.filesScanned} files`;
 }
 
 export function toPRComment(result: ScanResult, prTitle: string, prUrl: string): string {
-  const lines: string[] = [
+  const lines = [
     `## 🔍 argus-ci Security & Quality Scan`,
     `> **PR:** [${prTitle}](${prUrl})`,
     ``,
   ];
-
   if (result.skipped) {
     lines.push(`> ⚠️ Scan skipped: ${result.skipReason}`);
-    return lines.join("\n");
-  }
-
-  if (result.issues.length === 0) {
+  } else if (result.issues.length === 0) {
     lines.push(`✅ **No issues found** — ${result.filesScanned} files scanned in ${result.durationMs}ms`);
-    lines.push(`\n_Engines: ${result.engines.map((e) => ENGINE_LABEL[e] ?? e).join(", ")}_`);
+    lines.push(`_Engines: ${result.engines.map((e) => ENGINE_LABEL[e] ?? e).join(", ")}_`);
   } else {
-    lines.push(toMarkdown(result).replace(/^## 🔍 argus-ci scan results\n/, ""));
+    lines.push(toMarkdown(result).replace(/^## 🔍 argus-ci[^\n]*\n/, ""));
+  }
+  lines.push(`\n---\n_Generated by [argus-ci](https://github.com/venkatswaramoyya/argus-ci) · ${new Date().toISOString()}_`);
+  return lines.join("\n");
+}
+
+// ─── Brief mode (large scans) ─────────────────────────────────────────────────
+// Shows: summary stats → per-engine table → top security/dep issues → drill-down tip
+
+function toBriefMarkdown(result: ScanResult, context?: string): string {
+  const { issues, filesScanned, durationMs } = result;
+  const errors   = issues.filter((i) => i.severity === "error");
+  const warnings = issues.filter((i) => i.severity === "warning");
+  const lines: string[] = [];
+
+  lines.push(`## 🔍 argus-ci${context ? ` — ${context}` : " scan results"}`, "");
+
+  // ── Summary stats ──────────────────────────────────────────────────────────
+  lines.push(
+    `| | |`,
+    `|---|---|`,
+    `| 🔴 Errors   | **${errors.length}** |`,
+    `| 🟡 Warnings | **${warnings.length}** |`,
+    `| 📁 Files scanned | ${filesScanned} |`,
+    `| ⏱ Duration | ${(durationMs / 1000).toFixed(1)}s |`,
+    ``
+  );
+
+  // ── Per-engine breakdown table ─────────────────────────────────────────────
+  const byEngine = groupByEngine(issues);
+  const engineEntries = Object.entries(byEngine);
+  if (engineEntries.length > 0) {
+    lines.push(`### Issues by engine`, ``);
+    lines.push(`| Engine | 🔴 Errors | 🟡 Warnings | Top affected files |`);
+    lines.push(`|--------|-----------|-------------|-------------------|`);
+    for (const [eng, eIssues] of engineEntries) {
+      const eErrors = eIssues.filter((i) => i.severity === "error").length;
+      const eWarns  = eIssues.filter((i) => i.severity === "warning").length;
+      const label   = ENGINE_LABEL[eng as ScanEngine] ?? eng;
+      const topFiles = topAffectedFiles(eIssues, 3);
+      lines.push(`| ${label} | ${eErrors || "—"} | ${eWarns || "—"} | ${topFiles} |`);
+    }
+    lines.push("");
   }
 
-  lines.push(`\n---\n_Generated by [argus-ci](https://github.com/argus-ci/argus-ci) · ${new Date().toISOString()}_`);
+  // ── Top actionable issues (security + deps errors, max 15) ─────────────────
+  const actionable = issues
+    .filter((i) => i.severity === "error")
+    .filter((i) => isActionableEngine(i.engine))
+    .slice(0, 15);
+
+  if (actionable.length > 0) {
+    lines.push(`### 🔴 Top actionable issues`, ``);
+    for (const issue of actionable) {
+      const label  = ENGINE_LABEL[issue.engine as ScanEngine] ?? issue.engine;
+      const loc    = `\`${issue.path}:${issue.line}\``;
+      const msg    = issue.message.length > 120
+        ? issue.message.slice(0, 117) + "..."
+        : issue.message;
+      lines.push(`- **[${label}]** ${loc} — ${msg}`);
+      if (issue.fixSuggestion) lines.push(`  💡 ${issue.fixSuggestion}`);
+    }
+    lines.push("");
+  }
+
+  // ── Pre-existing debt notice if tsc/eslint dominate ────────────────────────
+  const tscCount = byEngine["tsc"]?.length ?? 0;
+  const eslintCount = byEngine["eslint"]?.length ?? 0;
+  const debtCount   = tscCount + eslintCount;
+  if (debtCount > 50) {
+    lines.push(
+      `> ℹ️ **Note:** ${debtCount.toLocaleString()} of the errors are TypeScript/ESLint issues`,
+      `> (${tscCount.toLocaleString()} tsc + ${eslintCount.toLocaleString()} ESLint).`,
+      `> These are typically pre-existing debt, not new issues from this scan.`,
+      ``
+    );
+  }
+
+  // ── Drill-down tip ──────────────────────────────────────────────────────────
+  lines.push(
+    `---`,
+    `_To drill into a specific file or folder:_`,
+    `\`\`\``,
+    `npx argus-ci scan src/auth/login.ts`,
+    `npx argus-ci scan src/components/`,
+    `\`\`\``,
+    `_Or ask your AI agent: "scan the files in context" or "scan src/auth/login.ts"_`
+  );
+
+  return lines.join("\n");
+}
+
+// ─── Detailed mode (targeted scans) ──────────────────────────────────────────
+// Shows: per-engine → per-file → per-issue with source line + fix hint
+
+function toDetailedMarkdown(result: ScanResult, context?: string): string {
+  const { issues, filesScanned, durationMs } = result;
+  const errors   = issues.filter((i) => i.severity === "error");
+  const warnings = issues.filter((i) => i.severity === "warning");
+  const infos    = issues.filter((i) => i.severity === "info");
+  const lines: string[] = [];
+
+  lines.push(`## 🔍 argus-ci${context ? ` — ${context}` : " scan results"}`, "");
+
+  // Summary
+  lines.push(
+    `| | Count |`,
+    `|---|---|`,
+    `| 🔴 Errors   | **${errors.length}** |`,
+    `| 🟡 Warnings | **${warnings.length}** |`,
+    `| 🔵 Info     | ${infos.length} |`,
+    `| 📁 Files    | ${filesScanned} |`,
+    `| ⏱ Duration  | ${durationMs}ms |`,
+    ``
+  );
+
+  // Per-engine > per-file > per-issue
+  const byEngine = groupByEngine(issues);
+  for (const [eng, engineIssues] of Object.entries(byEngine)) {
+    const engLabel = ENGINE_LABEL[eng as ScanEngine] ?? eng;
+    const eErr = engineIssues.filter((i) => i.severity === "error").length;
+    const eWrn = engineIssues.filter((i) => i.severity === "warning").length;
+    lines.push(`### ${engLabel} — ${eErr > 0 ? `${eErr} errors` : ""}${eErr > 0 && eWrn > 0 ? ", " : ""}${eWrn > 0 ? `${eWrn} warnings` : ""}`, "");
+
+    const byFile = groupByFile(engineIssues);
+    for (const [file, fileIssues] of Object.entries(byFile)) {
+      lines.push(`#### 📄 \`${file}\``);
+      for (const issue of fileIssues) {
+        const emoji = SEVERITY_EMOJI[issue.severity];
+        const sLabel = SEVERITY_LABEL[issue.severity];
+        lines.push(``, `**${emoji} ${sLabel}** · Line ${issue.line} · \`${issue.ruleId}\``);
+        lines.push(`> ${issue.message}`);
+        if (issue.sourceLine) {
+          lines.push(`\`\`\``, issue.sourceLine, `\`\`\``);
+        }
+        if (issue.fixSuggestion) lines.push(`💡 **Fix:** ${issue.fixSuggestion}`);
+        const meta: string[] = [];
+        if (issue.cwe?.length)   meta.push(`CWE: ${issue.cwe.join(", ")}`);
+        if (issue.owasp?.length) meta.push(`OWASP: ${issue.owasp.join(", ")}`);
+        if (meta.length)         lines.push(`_${meta.join(" · ")}_`);
+        if (issue.references?.length) lines.push(`_Refs: ${issue.references.slice(0, 2).join(", ")}_`);
+      }
+      lines.push("");
+    }
+  }
+
   return lines.join("\n");
 }
 
@@ -172,12 +261,39 @@ function groupByEngine(issues: Issue[]): Record<string, Issue[]> {
     const eng = issue.engine ?? "unknown";
     (out[eng] ??= []).push(issue);
   }
-  // Sort engines by severity (most errors first)
+  // Sort by ENGINE_PRIORITY (security first, quality last)
   return Object.fromEntries(
-    Object.entries(out).sort(([, a], [, b]) => {
-      const aE = a.filter((i) => i.severity === "error").length;
-      const bE = b.filter((i) => i.severity === "error").length;
-      return bE - aE;
+    Object.entries(out).sort(([a], [b]) => {
+      const pa = ENGINE_PRIORITY[a as ScanEngine] ?? 99;
+      const pb = ENGINE_PRIORITY[b as ScanEngine] ?? 99;
+      if (pa !== pb) return pa - pb;
+      // Within same priority, sort by error count desc
+      const ae = out[a]!.filter((i) => i.severity === "error").length;
+      const be = out[b]!.filter((i) => i.severity === "error").length;
+      return be - ae;
     })
   );
+}
+
+/** Returns top N most-affected files for a set of issues, as a short string */
+function topAffectedFiles(issues: Issue[], max: number): string {
+  const counts = new Map<string, number>();
+  for (const i of issues) counts.set(i.path, (counts.get(i.path) ?? 0) + 1);
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const top = sorted.slice(0, max).map(([f]) => basename(f));
+  const rest = sorted.length - max;
+  return top.join(", ") + (rest > 0 ? ` +${rest} more` : "");
+}
+
+function basename(path: string): string {
+  return path.split("/").pop() ?? path;
+}
+
+/** Security + dep engines are actionable; tsc/eslint debt is not */
+function isActionableEngine(engine: ScanEngine | string): boolean {
+  const actionable: Array<ScanEngine | string> = [
+    "opengrep", "semgrep", "bearer", "sonar",
+    "dependabot", "npm-audit", "pip-audit", "bundler-audit", "cargo-audit",
+  ];
+  return actionable.includes(engine);
 }

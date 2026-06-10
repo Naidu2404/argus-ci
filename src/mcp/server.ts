@@ -22,7 +22,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { scanFiles, scanStaged, scanBranch, scanRepo } from "../core/scanner.js";
+import { scanFiles, scanStaged, scanBranch, scanRepo, scanContext } from "../core/scanner.js";
 import { fetchPRFiles, postPRComment } from "../core/github.js";
 import { detectRulesets } from "../core/detector.js";
 import { toMarkdown, toPRComment } from "../core/reporter.js";
@@ -31,7 +31,7 @@ import { getConfigStatus } from "../core/config.js";
 
 const server = new McpServer({
   name:    "argus-ci",
-  version: "2.0.0",
+  version: "2.0.1",
 });
 
 // ─── Tool: scan_files ─────────────────────────────────────────────────────────
@@ -220,6 +220,37 @@ server.tool(
 
     const result   = await scanRepo(workdir, config);
     const markdown = toMarkdown(result, `full repository (${result.filesScanned} files)`);
+    const hasErrors = result.issues.some((i) => i.severity === "error");
+
+    return {
+      content: [{ type: "text" as const, text: markdown }],
+      isError: hasErrors,
+    };
+  }
+);
+
+// ─── Tool: scan_context ───────────────────────────────────────────────────────
+// Scans the files the AI agent is actively working on. Ideal trigger: end of task.
+
+server.tool(
+  "scan_context",
+  "Scan the files you just wrote or modified in this session. " +
+  "If `files` is provided, scans exactly those files. " +
+  "Otherwise auto-detects all modified files in the git working tree (staged + unstaged changes vs HEAD). " +
+  "Use this at the end of any coding task — it catches issues in only the changed files, not the whole repo.",
+  {
+    files: z.array(z.string()).optional().describe(
+      "Specific files to scan. If omitted, detects modified files from git working tree."
+    ),
+    cwd: z.string().optional().describe(
+      "Repo root. Defaults to process.cwd()"
+    ),
+  },
+  async ({ files, cwd }) => {
+    const workdir = cwd ?? process.cwd();
+    const result  = await scanContext(workdir, files, {});
+    const fileCount = files?.length ?? result.filesScanned;
+    const markdown  = toMarkdown(result, `${fileCount} context file${fileCount !== 1 ? "s" : ""}`);
     const hasErrors = result.issues.some((i) => i.severity === "error");
 
     return {

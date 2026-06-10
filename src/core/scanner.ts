@@ -93,6 +93,42 @@ async function scanFilesInternal(
   return merged;
 }
 
+/**
+ * scanContext — scan the files the AI agent is currently working on.
+ * Finds all files modified in the working tree (staged + unstaged) vs HEAD.
+ * Also accepts an explicit file list — if provided, those are scanned directly.
+ */
+export async function scanContext(
+  cwd:   string,
+  files: string[] | undefined,
+  config: ScanConfig = {}
+): Promise<ScanResult> {
+  // If explicit files were given, just scan them
+  if (files && files.length > 0) {
+    return scanFiles(files, cwd, config);
+  }
+
+  // Otherwise detect modified files from git (staged + unstaged)
+  let modified: string[];
+  try {
+    const staged   = execSync("git diff --name-only --cached --diff-filter=ACM", { cwd, encoding: "utf8" }).trim();
+    const unstaged = execSync("git diff --name-only --diff-filter=ACM", { cwd, encoding: "utf8" }).trim();
+    const combined = new Set([
+      ...staged.split("\n").filter(Boolean),
+      ...unstaged.split("\n").filter(Boolean),
+    ]);
+    modified = [...combined];
+  } catch {
+    return empty("Not a git repository or no modified files found", Date.now(), config);
+  }
+
+  if (modified.length === 0) {
+    return empty("No modified files in working tree — nothing to scan", Date.now(), config);
+  }
+
+  return scanFiles(modified, cwd, config);
+}
+
 export async function scanStaged(cwd: string, config: ScanConfig = {}): Promise<ScanResult> {
   let staged: string[];
   try {

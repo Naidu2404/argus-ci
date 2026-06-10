@@ -79,15 +79,18 @@ async function fetchSonarIssues(
   const PAGE_SIZE = 500;
 
   while (true) {
+    // SonarCloud & SonarQube both use `componentKeys` to filter by project or file.
+    // `projectKeys` is a deprecated alias that some versions ignore — always use componentKeys.
     const params = new URLSearchParams({
-      projectKeys: projectKey,
-      statuses:    "OPEN,CONFIRMED,REOPENED",
-      ps:          String(PAGE_SIZE),
-      p:           String(page),
+      componentKeys: componentFilter ?? projectKey,  // file filter or whole-project
+      statuses:      "OPEN,CONFIRMED,REOPENED",
+      resolved:      "false",
+      ps:            String(PAGE_SIZE),
+      p:             String(page),
     });
 
-    if (org)             params.set("organization",  org);
-    if (componentFilter) params.set("componentKeys", componentFilter);
+    // SonarCloud requires `organization`; self-hosted SonarQube does not need it.
+    if (org) params.set("organization", org);
 
     const url = `${serverUrl}/api/issues/search?${params.toString()}`;
     const res  = await fetch(url, {
@@ -99,13 +102,20 @@ async function fetchSonarIssues(
 
     if (!res.ok) {
       const errBody = await res.text().catch(() => "");
+      // Surface the raw body in the error so users can debug token/org issues
       if (res.status === 401) throw new Error("SONAR_TOKEN is invalid or expired");
-      if (res.status === 403) throw new Error("SONAR_TOKEN lacks project browse permission");
-      if (res.status === 404) throw new Error(`Project "${projectKey}" not found in Sonar`);
-      throw new Error(`HTTP ${res.status}: ${errBody.slice(0, 200)}`);
+      if (res.status === 403) throw new Error("SONAR_TOKEN lacks project browse permission — ensure 'Browse' on the project");
+      if (res.status === 404) throw new Error(`Project key "${projectKey}" not found in Sonar — double-check SONAR_PROJECT_KEY`);
+      throw new Error(`Sonar HTTP ${res.status}: ${errBody.slice(0, 300)}`);
     }
 
-    const body   = await res.json() as SonarResponse;
+    const body = await res.json() as SonarResponse;
+
+    // Detect empty/unexpected response (e.g. wrong org, no project access)
+    if (!body.paging) {
+      throw new Error(`Unexpected Sonar response — check SONAR_PROJECT_KEY and SONAR_ORGANIZATION are correct`);
+    }
+
     const issues = body.issues ?? [];
 
     for (const si of issues) {
