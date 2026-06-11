@@ -85,14 +85,47 @@ export function saveConfig(updates: Partial<ArgusConfig>): void {
 
 // ─── Token / setting resolvers ────────────────────────────────────────────────
 
-/** Credential resolution: env var → global config (never per-repo) */
-function getCredential(envVar: string, configKey: keyof ArgusConfig): string | undefined {
-  return process.env[envVar] || loadFile(GLOBAL_CONFIG_PATH)[configKey] || undefined;
+/**
+ * Returns true when an env var value is a template/sandbox placeholder rather
+ * than a real credential.  Known offenders:
+ *
+ *   <SONAR_TOKEN>    ← Cursor agent sandbox injects this literal string
+ *   <GITHUB_TOKEN>   ← same pattern for other tokens
+ *   ${SONAR_TOKEN}   ← un-substituted shell variable
+ *   $SONAR_TOKEN     ← same
+ *
+ * When a placeholder is detected, getCredential() falls through to
+ * ~/.argus-ci.json so the real stored token is used instead.
+ */
+function isPlaceholder(value: string): boolean {
+  if (!value || value.trim().length < 8) return true;
+  const v = value.trim();
+  // <TOKEN_NAME> or <tokenName>  — Cursor / CI template placeholder
+  if (/^<[A-Za-z_][A-Za-z0-9_]*>$/.test(v)) return true;
+  // ${VAR_NAME} or $VAR_NAME  — un-substituted shell variable
+  if (/^\$\{?[A-Z_][A-Z0-9_]*\}?$/.test(v)) return true;
+  // Common copy-paste boilerplate words
+  if (/^(your[_-]?|replace[_-]?|enter[_-]?|insert[_-]?|add[_-]?|xxx|todo)/i.test(v)) return true;
+  return false;
 }
 
-/** Project setting resolution: env var → local config → global config */
+/** Credential resolution: env var → global config (never per-repo).
+ *  Env var values that look like un-substituted placeholders (e.g. Cursor's
+ *  <SONAR_TOKEN> sandbox injection) are silently ignored so that real tokens
+ *  stored in ~/.argus-ci.json always win over them.
+ */
+function getCredential(envVar: string, configKey: keyof ArgusConfig): string | undefined {
+  const envVal = process.env[envVar];
+  if (envVal && !isPlaceholder(envVal)) return envVal;
+  return loadFile(GLOBAL_CONFIG_PATH)[configKey] as string | undefined || undefined;
+}
+
+/** Project setting resolution: env var → local config → global config.
+ *  Also skips placeholder env var values.
+ */
 function getProjectSetting(envVar: string, configKey: keyof ArgusConfig, cwd?: string): string | undefined {
-  if (process.env[envVar]) return process.env[envVar];
+  const envVal = process.env[envVar];
+  if (envVal && !isPlaceholder(envVal)) return envVal;
   if (cwd) {
     const local = loadFile(join(cwd, ".argus-ci.json"))[configKey];
     if (local) return local as string;
@@ -124,21 +157,28 @@ export function getConfigStatus(cwd?: string): ConfigStatus {
   const localPath = cwd ? join(cwd, ".argus-ci.json") : null;
   const local     = localPath && localPath !== GLOBAL_CONFIG_PATH ? loadFile(localPath) : {};
 
+  // Use the same placeholder-aware resolution as getCredential/getProjectSetting
+  // so check_setup reflects what scans will actually use.
+  const realEnv = (key: string) => {
+    const v = process.env[key];
+    return (v && !isPlaceholder(v)) ? v : undefined;
+  };
+
   const sonarProjectKey =
-    process.env.SONAR_PROJECT_KEY || local.sonarProjectKey || global.sonarProjectKey;
+    realEnv("SONAR_PROJECT_KEY") || local.sonarProjectKey || global.sonarProjectKey;
 
   return {
-    groq:            !!(process.env.GROQ_API_KEY      || global.groqApiKey),
-    anthropic:       !!(process.env.ANTHROPIC_API_KEY || global.anthropicApiKey),
-    github:          !!(process.env.GITHUB_TOKEN      || global.githubToken),
-    sonar:           !!(process.env.SONAR_TOKEN       || global.sonarToken),
+    groq:            !!(realEnv("GROQ_API_KEY")      || global.groqApiKey),
+    anthropic:       !!(realEnv("ANTHROPIC_API_KEY") || global.anthropicApiKey),
+    github:          !!(realEnv("GITHUB_TOKEN")      || global.githubToken),
+    sonar:           !!(realEnv("SONAR_TOKEN")       || global.sonarToken),
     sonarProject:    !!sonarProjectKey,
     sonarProjectKey: sonarProjectKey as string | undefined,
     sonarSource:     local.sonarProjectKey
       ? "local (.argus-ci.json)"
       : global.sonarProjectKey
         ? "global (~/.argus-ci.json)"
-        : process.env.SONAR_PROJECT_KEY
+        : realEnv("SONAR_PROJECT_KEY")
           ? "env var"
           : undefined,
     globalConfigFile: existsSync(GLOBAL_CONFIG_PATH),
