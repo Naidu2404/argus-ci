@@ -23,7 +23,7 @@ import { detectRulesets }            from "./detector.js";
 import { runQualityScan, isQualityEngineInstalled } from "./quality.js";
 import { runProjectChecks }          from "./project.js";
 import { runDepsCheck }              from "./deps.js";
-import { runSonarCheck }             from "./sonar.js";
+import { runSonarCheck, toRelativePath, filterIssuesToFiles } from "./sonar.js";
 import { enrichWithAI }              from "./ai.js";
 
 const DEFAULT_RULESETS = ["p/secrets", "p/owasp-top-ten", "p/security-audit"];
@@ -84,6 +84,22 @@ async function scanFilesInternal(
   }
 
   let merged = results.length === 1 ? results[0]! : mergeAll(results, t0);
+
+  // Scope filter: on targeted scans, strip any issues that leaked in from outside
+  // the requested file set (e.g. a pass that operates project-wide by design).
+  // Dependency audit engines (dependabot, npm-audit, pip-audit, bundler-audit, cargo-audit)
+  // are excluded from this filter because they report package-level findings, not file paths.
+  if (!isRepoScan && files.length > 0) {
+    const relFiles = files.map((f) => toRelativePath(f, cwd));
+    const depEngines = new Set(["dependabot", "npm-audit", "pip-audit", "bundler-audit", "cargo-audit"]);
+    merged = {
+      ...merged,
+      issues: merged.issues.filter((issue) => {
+        if (depEngines.has(issue.engine ?? "")) return true; // always keep dep findings
+        return filterIssuesToFiles([issue], relFiles).length > 0;
+      }),
+    };
+  }
 
   // AI enrichment — optional, adds fixSuggestion to error-level findings
   if (config.runAI ?? true) {

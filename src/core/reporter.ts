@@ -66,10 +66,15 @@ export function toMarkdown(result: ScanResult, context?: string): string {
     return lines.join("\n");
   }
 
-  // Choose display mode based on scale
+  // Choose display mode based on scale.
+  // Small targeted scans (≤10 files) always use detailed mode so per-file Sonar
+  // findings (which are often MINOR/info severity) are shown and not buried behind
+  // the brief top-15 summary.  Brief mode only kicks in for large scans (many files
+  // OR many issues AND more than 10 files scanned).
+  const isSmallTargetedScan = filesScanned <= 10;
   const useBrief =
-    issues.length > BRIEF_THRESHOLD_ISSUES ||
-    filesScanned > BRIEF_THRESHOLD_FILES;
+    !isSmallTargetedScan &&
+    (issues.length > BRIEF_THRESHOLD_ISSUES || filesScanned > BRIEF_THRESHOLD_FILES);
 
   return useBrief
     ? toBriefMarkdown(result, context)

@@ -31,7 +31,7 @@ import { getConfigStatus } from "../core/config.js";
 
 const server = new McpServer({
   name:    "argus-ci",
-  version: "2.0.3",
+  version: "2.0.8",
 });
 
 // ─── Tool: scan_files ─────────────────────────────────────────────────────────
