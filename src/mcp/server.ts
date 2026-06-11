@@ -31,7 +31,7 @@ import { getConfigStatus } from "../core/config.js";
 
 const server = new McpServer({
   name:    "argus-ci",
-  version: "2.0.1",
+  version: "2.0.3",
 });
 
 // ─── Tool: scan_files ─────────────────────────────────────────────────────────
@@ -374,7 +374,7 @@ server.tool(
   },
   async ({ cwd }) => {
     const workdir = cwd ?? process.cwd();
-    const status  = getConfigStatus();
+    const status  = getConfigStatus(workdir);   // pass cwd so per-repo SONAR_PROJECT_KEY is picked up
     const stack   = detectRulesets(workdir);
 
     const lines: string[] = [

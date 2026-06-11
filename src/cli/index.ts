@@ -1,5 +1,5 @@
 /**
- * argus-ci CLI v2.0.1
+ * argus-ci CLI v2.0.3
  *
  * Commands:
  *   argus-ci                        Start MCP server (default when invoked by Cursor/Claude)
@@ -48,7 +48,7 @@ async function main(): Promise<void> {
     case "check_setup":
     case "status": {
       const cwd    = process.cwd();
-      const status = getConfigStatus();
+      const status = getConfigStatus(cwd);   // pass cwd so per-repo SONAR_PROJECT_KEY is picked up
       const stack  = detectRulesets(cwd);
 
       console.log(`
@@ -173,7 +173,7 @@ Run \`npx argus-ci setup --configure\` to add missing tokens.
 
 function printHelp(): void {
   console.log(`
-argus-ci v2.0.1 — 6-pass security & quality agent
+argus-ci v2.0.3 — 6-pass security & quality agent
 
 USAGE
   argus-ci                           Start MCP server (Cursor / Claude Code)
