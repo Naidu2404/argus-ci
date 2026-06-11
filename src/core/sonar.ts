@@ -47,19 +47,27 @@ export async function runSonarCheck(
   const serverUrl = getSonarServerUrl(cwd).replace(/\/$/, "");
   const org       = getSonarOrganization(cwd);
 
-  // Build the component path filter from our file list
-  // Sonar uses "projectKey:src/path/to/file.ts" format
-  const componentFilter = isRepoScan
+  // Build file path filter for targeted scans.
+  //
+  // WHY NOT componentKeys=projectKey:src/file.ts ?
+  //   SonarCloud indexes files relative to `sonar.sources` in sonar-project.properties.
+  //   If sonar.sources=src, the component key is `projectKey:components/file.ts` (no src/).
+  //   We don't know sonar.sources at runtime, so building `projectKey:src/...` is fragile
+  //   and misses issues stored under a different path prefix → wrong issue count.
+  //
+  // CORRECT APPROACH:
+  //   Use `componentKeys=projectKey` (whole-project, always correct) plus a separate
+  //   `files` parameter (paths relative to the project root, not sonar.sources).
+  //   SonarCloud's `files` param accepts repo-root-relative paths — e.g. `src/foo/bar.ts`.
+  //   This is reliable regardless of what sonar.sources is set to.
+  const fileFilter = isRepoScan
     ? undefined   // no file filter — fetch all open issues for the project
     : files
-        .map((f) => {
-          const rel = f.startsWith(cwd) ? f.slice(cwd.length + 1) : f;
-          return `${projectKey}:${rel}`;
-        })
+        .map((f) => f.startsWith(cwd) ? f.slice(cwd.length + 1) : f)
         .join(",");
 
   try {
-    const issues = await fetchSonarIssues(serverUrl, token, projectKey, org, componentFilter);
+    const issues = await fetchSonarIssues(serverUrl, token, projectKey, org, fileFilter);
     return {
       issues, skipped: false,
       filesScanned: files.length, durationMs: Date.now() - t0,
@@ -73,26 +81,30 @@ export async function runSonarCheck(
 // ─── API fetch ────────────────────────────────────────────────────────────────
 
 async function fetchSonarIssues(
-  serverUrl:       string,
-  token:           string,
-  projectKey:      string,
-  org:             string | undefined,
-  componentFilter: string | undefined,
+  serverUrl:  string,
+  token:      string,
+  projectKey: string,
+  org:        string | undefined,
+  fileFilter: string | undefined,   // comma-separated repo-root-relative paths, or undefined for all
 ): Promise<Issue[]> {
   const allIssues: Issue[] = [];
   let page = 1;
   const PAGE_SIZE = 500;
 
   while (true) {
-    // SonarCloud & SonarQube both use `componentKeys` to filter by project or file.
-    // `projectKeys` is a deprecated alias that some versions ignore — always use componentKeys.
+    // Always scope to the project key — never pass a file-level component key in componentKeys.
+    // File filtering is done via the separate `files` param (repo-root-relative paths), which
+    // works correctly regardless of sonar.sources setting in sonar-project.properties.
     const params = new URLSearchParams({
-      componentKeys: componentFilter ?? projectKey,  // file filter or whole-project
+      componentKeys: projectKey,
       statuses:      "OPEN,CONFIRMED,REOPENED",
       resolved:      "false",
       ps:            String(PAGE_SIZE),
       p:             String(page),
     });
+
+    // File-level filter (targeted scans only — omitted for repo scans)
+    if (fileFilter) params.set("files", fileFilter);
 
     // SonarCloud requires `organization`; self-hosted SonarQube does not need it.
     if (org) params.set("organization", org);

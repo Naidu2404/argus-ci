@@ -1,29 +1,56 @@
-# Semgrep Quality Gate
+# argus-ci — 6-Pass Security & Quality Gate
 
 ## MANDATORY: After every file write or edit
 
-Call the scan_files MCP tool on every file you just created or modified.
-Do this BEFORE reporting the task as complete.
+Call scan_files on every file you just created or modified — BEFORE reporting the task as complete.
 
 scan_files({
   files: ["<files you modified>"],
   cwd: "<repo root>"
 })
 
+This runs 6 passes: Opengrep (security), Bearer (data-flow), quality linter, ESLint, dependency audit,
+and SonarQube/Cloud. All passes report in one call — no separate Sonar step needed.
+
+## Present ALL 6 passes in your FIRST response
+
+Do NOT present a "basic" scan and wait for the user to ask about Sonar or other engines.
+Every engine that ran must appear in the first report. Use this structure:
+
+  ## Scan results: `<file>`
+
+  Passes: Opengrep · Bearer · ESLint · SonarQube/Cloud · npm audit
+
+  ### Security (Opengrep / Bearer)
+  [findings or ✅ clean]
+
+  ### SonarQube/Cloud
+  [findings or ✅ clean — always show Sonar explicitly, never omit it]
+
+  ### Dependencies
+  [findings or ✅ clean]
+
+  ### Code quality
+  [findings or ✅ clean]
+
+Even when a pass has zero findings, say "✅ No issues" — never silently skip an engine.
+
 ## On findings
 
-- ERROR severity: Fix immediately. Do not mark task done until errors are resolved.
-- WARNING severity: Show to user, explain the risk, let them decide.
-- INFO severity: Mention at the end as a note.
-- Clean scan: Tell the user explicitly that the code passed Semgrep checks.
+- ERROR: Fix immediately. Do not mark task done until errors are resolved.
+- WARNING: Show to user, explain the risk, let them decide.
+- INFO: List at the end. Non-blocking.
+- Clean: Say "All 6 passes clean."
 
 ## On user requests to review
 
-- "review PR <url>" → scan_pr({ pr_url: "<url>" })
-- "check branch X" → scan_branch({ branch: "X", base: "main" })
-- "check my changes" / "before I commit" → scan_staged({})
+- "review PR <url>"       → scan_pr({ pr_url: "<url>" })
+- "check branch X"        → scan_branch({ branch: "X", base: "main" })
+- "check my changes"      → scan_staged({})
+- "scan context" / "scan what I'm working on" → scan_context({})
 
 ## Non-negotiable
 
 Never commit or suggest committing code with unresolved ERROR-severity findings.
 Never skip the post-generation scan.
+Never show only one engine and defer others to a follow-up — all 6 passes in the first report.

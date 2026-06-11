@@ -39,8 +39,15 @@ const server = new McpServer({
 
 server.tool(
   "scan_files",
-  "Scan specific files with Semgrep for security vulnerabilities and quality issues. " +
-  "Call this immediately after generating or modifying code files.",
+  "Run all 6 security & quality passes on specific files: " +
+  "(1) Opengrep/Semgrep — OWASP/secrets/injection, " +
+  "(2) Bearer — data-flow security, " +
+  "(3) quality linter — Oxlint/Ruff/etc., " +
+  "(4) ESLint + Prettier — project lint/format, " +
+  "(5) dependency audit — CVE/Dependabot, " +
+  "(6) SonarQube/Cloud — complexity, code smells, security hotspots. " +
+  "Call immediately after generating or modifying code. " +
+  "Present ALL engine results (including Sonar) in your FIRST response — never defer any engine to a follow-up.",
   {
     files: z.array(z.string()).describe(
       "List of file paths to scan (relative to cwd or absolute)"
@@ -80,7 +87,8 @@ server.tool(
 
 server.tool(
   "scan_staged",
-  "Scan all git-staged files with Semgrep. Use this before committing to catch issues in code about to be committed.",
+  "Run all 6 passes (Opengrep, Bearer, ESLint, SonarQube/Cloud, dependency audit, AI enrichment) on git-staged files. " +
+  "Use before committing. Present ALL engine results including Sonar in the first response.",
   {
     cwd: z.string().optional().describe("Repo root directory. Defaults to process.cwd()"),
     rulesets: z.array(z.string()).optional().describe("Semgrep rulesets to use. Defaults to auto-detected."),
@@ -106,8 +114,8 @@ server.tool(
 
 server.tool(
   "scan_branch",
-  "Scan all files changed on a branch compared to a base branch (default: main). " +
-  "Use when asked to review a branch or check what a feature branch introduces.",
+  "Run all 6 passes (Opengrep, Bearer, ESLint, SonarQube/Cloud, dependency audit) on all files changed on a branch vs a base branch (default: main). " +
+  "Use when asked to review a branch. Present ALL engine results including Sonar in the first response.",
   {
     branch: z.string().describe("Branch name to scan (e.g. feature/auth)"),
     base:   z.string().optional().default("main").describe("Base branch to compare against (default: main)"),
@@ -234,10 +242,12 @@ server.tool(
 
 server.tool(
   "scan_context",
-  "Scan the files you just wrote or modified in this session. " +
+  "Run all 6 security & quality passes on the files modified in this session: " +
+  "Opengrep (security), Bearer (data-flow), quality linter, ESLint, dependency audit, and SonarQube/Cloud. " +
   "If `files` is provided, scans exactly those files. " +
   "Otherwise auto-detects all modified files in the git working tree (staged + unstaged changes vs HEAD). " +
-  "Use this at the end of any coding task — it catches issues in only the changed files, not the whole repo.",
+  "Use this at the end of any coding task. " +
+  "Present ALL engine results (including Sonar) in your FIRST response — never defer any engine to a follow-up.",
   {
     files: z.array(z.string()).optional().describe(
       "Specific files to scan. If omitted, detects modified files from git working tree."
