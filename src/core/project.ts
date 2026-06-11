@@ -24,8 +24,8 @@ export async function runProjectChecks(
 ): Promise<ScanResult> {
   const results: ScanResult[] = [];
 
-  const eslint  = runEslint(files, cwd, t0, isRepoScan);
-  const tsc     = runTsc(cwd, t0);
+  const eslint   = runEslint(files, cwd, t0, isRepoScan);
+  const tsc      = runTsc(files, cwd, t0, isRepoScan);
   const prettier = runPrettier(files, cwd, t0, isRepoScan);
 
   results.push(eslint, tsc, prettier);
@@ -102,8 +102,19 @@ function runEslint(files: string[], cwd: string, t0: number, isRepoScan = false)
 }
 
 // ─── TypeScript (tsc --noEmit) ────────────────────────────────────────────────
+//
+// tsc always compiles the entire project regardless of what files you give it.
+// For targeted scans (1–10 files), running a full project compile is:
+//   (a) slow  — can take 30–90 s on large repos
+//   (b) noisy — reports thousands of pre-existing errors unrelated to the scan
+//
+// Strategy:
+//   • isRepoScan OR files > 10 → run full tsc, filter output to target files
+//   • files <= 10 (targeted)   → skip tsc, report skipped so the reporter can surface this
 
-function runTsc(cwd: string, t0: number): ScanResult {
+const TSC_TARGETED_THRESHOLD = 10;
+
+function runTsc(files: string[], cwd: string, t0: number, isRepoScan: boolean): ScanResult {
   // Only run if tsconfig.json exists
   if (!existsSync(join(cwd, "tsconfig.json"))) {
     return skip("No tsconfig.json found", t0, []);
@@ -112,8 +123,16 @@ function runTsc(cwd: string, t0: number): ScanResult {
   const bin = findBin("tsc", cwd);
   if (!bin) return skip("TypeScript not installed (run npm install)", t0, []);
 
+  // Skip full project compile for targeted scans — too slow and too noisy
+  if (!isRepoScan && files.length <= TSC_TARGETED_THRESHOLD) {
+    return skip(
+      `tsc skipped for targeted scan (${files.length} file${files.length !== 1 ? "s" : ""}) — use scan_repo for full project TypeScript check`,
+      t0, []
+    );
+  }
+
   const r = spawnSync(bin, ["--noEmit", "--pretty", "false"], {
-    cwd, encoding: "utf8", maxBuffer: 20 * 1024 * 1024, timeout: 60_000,
+    cwd, encoding: "utf8", maxBuffer: 20 * 1024 * 1024, timeout: 90_000,
   });
 
   const output = ((r.stdout ?? "") + (r.stderr ?? "")).trim();
@@ -123,11 +142,20 @@ function runTsc(cwd: string, t0: number): ScanResult {
   const issues: Issue[] = [];
   const lineRe = /^(.+?)\((\d+),(\d+)\):\s+(error|warning)\s+(TS\d+):\s+(.+)$/;
 
+  // For non-repo scans with many files, filter output to the scanned files only
+  const targetSet = isRepoScan
+    ? null  // null = include everything
+    : new Set(files.map((f) => (f.startsWith("/") ? relative(cwd, f) : f)));
+
   for (const line of output.split("\n")) {
     const m = line.match(lineRe);
     if (!m) continue;
     const [, filePath, lineStr, colStr, sev, code, msg] = m;
     const relPath = filePath!.startsWith(cwd) ? filePath!.slice(cwd.length + 1) : filePath!;
+
+    // Skip issues outside the target file set (for non-repo targeted scans)
+    if (targetSet && !targetSet.has(relPath)) continue;
+
     issues.push({
       ruleId:   `tsc/${code}`,
       path:     relPath!,
@@ -141,7 +169,7 @@ function runTsc(cwd: string, t0: number): ScanResult {
 
   return {
     issues, skipped: false,
-    filesScanned: 0, durationMs: Date.now() - t0,
+    filesScanned: isRepoScan ? 0 : files.length, durationMs: Date.now() - t0,
     rulesets: ["tsc/strict"], engines: ["tsc"],
   };
 }

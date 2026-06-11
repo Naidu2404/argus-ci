@@ -55,12 +55,15 @@ export function toMarkdown(result: ScanResult, context?: string): string {
   const { issues, filesScanned } = result;
 
   if (issues.length === 0) {
-    return [
+    const lines = [
       `## 🔍 argus-ci${context ? ` — ${context}` : ""}`,
       ``,
       `✅ **No issues found** — ${filesScanned} file${filesScanned !== 1 ? "s" : ""} scanned in ${result.durationMs}ms`,
       `_Engines: ${result.engines.map((e) => ENGINE_LABEL[e] ?? e).join(" · ")}_`,
-    ].join("\n");
+    ];
+    const skippedSection = renderSkippedEngines(result.skippedEngines);
+    if (skippedSection) lines.push("", skippedSection);
+    return lines.join("\n");
   }
 
   // Choose display mode based on scale
@@ -182,6 +185,10 @@ function toBriefMarkdown(result: ScanResult, context?: string): string {
     `_Or ask your AI agent: "scan the files in context" or "scan src/auth/login.ts"_`
   );
 
+  // ── Skipped passes ──────────────────────────────────────────────────────────
+  const skippedSection = renderSkippedEngines(result.skippedEngines);
+  if (skippedSection) lines.push("", skippedSection);
+
   return lines.join("\n");
 }
 
@@ -238,6 +245,10 @@ function toDetailedMarkdown(result: ScanResult, context?: string): string {
       lines.push("");
     }
   }
+
+  // Skipped passes (e.g. Sonar not configured, tsc skipped for targeted scan)
+  const skippedSection = renderSkippedEngines(result.skippedEngines);
+  if (skippedSection) lines.push(skippedSection);
 
   return lines.join("\n");
 }
@@ -296,4 +307,46 @@ function isActionableEngine(engine: ScanEngine | string): boolean {
     "dependabot", "npm-audit", "pip-audit", "bundler-audit", "cargo-audit",
   ];
   return actionable.includes(engine);
+}
+
+/**
+ * Renders a compact "passes not run" section for the bottom of any scan report.
+ * Sonar gets special treatment since its skip reason often contains actionable setup steps.
+ */
+function renderSkippedEngines(skippedEngines?: Record<string, string>): string | null {
+  if (!skippedEngines || Object.keys(skippedEngines).length === 0) return null;
+
+  const lines: string[] = ["---", "**Passes not run:**", ""];
+
+  // Surface Sonar first (most commonly actionable)
+  const ORDER = ["sonar", "tsc", "prettier", "bearer", "ai", "dependabot", "npm-audit"];
+  const sorted = [
+    ...ORDER.filter((e) => e in skippedEngines),
+    ...Object.keys(skippedEngines).filter((e) => !ORDER.includes(e)),
+  ];
+
+  for (const engine of sorted) {
+    const reason = skippedEngines[engine]!;
+    const label  = ENGINE_LABEL[engine as ScanEngine] ?? engine;
+
+    if (engine === "sonar") {
+      // Sonar skip is almost always actionable — highlight it
+      const isNotConfigured = /not set|not configured|run.*configure/i.test(reason);
+      if (isNotConfigured) {
+        lines.push(
+          `- ⚙️ **${label}** — not configured for this repo`,
+          `  Run \`npx argus-ci setup --configure\` in this folder to add \`SONAR_PROJECT_KEY\``,
+          `  _(project-specific — safe to commit to \`.argus-ci.json\`)_`,
+        );
+      } else {
+        lines.push(`- ⚠️ **${label}** — ${reason}`);
+      }
+    } else if (engine === "tsc") {
+      lines.push(`- ℹ️ **${label}** — ${reason}`);
+    } else {
+      lines.push(`- ℹ️ **${label}** — ${reason}`);
+    }
+  }
+
+  return lines.join("\n");
 }

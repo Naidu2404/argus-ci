@@ -94,13 +94,14 @@ export interface Issue {
 // ─── Scan result ──────────────────────────────────────────────────────────────
 
 export interface ScanResult {
-  issues:       Issue[];
-  skipped:      boolean;
-  skipReason?:  string;
-  filesScanned: number;
-  durationMs:   number;
-  rulesets:     string[];
-  engines:      ScanEngine[];   // which scanners actually ran
+  issues:          Issue[];
+  skipped:         boolean;
+  skipReason?:     string;
+  filesScanned:    number;
+  durationMs:      number;
+  rulesets:        string[];
+  engines:         ScanEngine[];   // which scanners actually ran
+  skippedEngines?: Record<string, string>;  // engine → skip reason (e.g. "sonar" → "SONAR_PROJECT_KEY not set")
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────

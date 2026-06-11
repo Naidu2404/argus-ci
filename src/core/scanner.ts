@@ -335,15 +335,42 @@ function mergeAll(results: ScanResult[], t0: number): ScanResult {
     }
   }
 
+  // Collect skip reasons from each pass so the reporter can surface them.
+  // We key each reason by its engine name (inferred from rulesets or a short skip-reason parse).
+  const skippedEngines: Record<string, string> = {};
+  for (const r of results) {
+    if (r.skipped && r.skipReason) {
+      // Best-effort engine name from the skip reason prefix
+      const engineKey = inferSkippedEngine(r.skipReason);
+      skippedEngines[engineKey] = r.skipReason;
+    }
+  }
+
   const primary = results[0]!;
   return {
-    issues:       deduped,
-    skipped:      results.every((r) => r.skipped),
-    filesScanned: primary.filesScanned,
-    durationMs:   Date.now() - t0,
-    rulesets:     [...new Set(results.flatMap((r) => r.rulesets))],
-    engines:      [...new Set(results.flatMap((r) => r.engines))],
+    issues:         deduped,
+    skipped:        results.every((r) => r.skipped),
+    filesScanned:   primary.filesScanned,
+    durationMs:     Date.now() - t0,
+    rulesets:       [...new Set(results.flatMap((r) => r.rulesets))],
+    engines:        [...new Set(results.flatMap((r) => r.engines))],
+    skippedEngines: Object.keys(skippedEngines).length > 0 ? skippedEngines : undefined,
   };
+}
+
+function inferSkippedEngine(reason: string): string {
+  if (/sonar/i.test(reason))    return "sonar";
+  if (/tsc|typescript/i.test(reason)) return "tsc";
+  if (/eslint/i.test(reason))   return "eslint";
+  if (/prettier/i.test(reason)) return "prettier";
+  if (/bearer/i.test(reason))   return "bearer";
+  if (/groq|anthropic|ai/i.test(reason)) return "ai";
+  if (/dependabot|github/i.test(reason)) return "dependabot";
+  if (/npm.audit/i.test(reason)) return "npm-audit";
+  if (/pip.audit/i.test(reason)) return "pip-audit";
+  if (/opengrep|semgrep/i.test(reason)) return "opengrep";
+  // Fallback: use first word of reason
+  return reason.split(/[\s:]/)[0]?.toLowerCase() ?? "unknown";
 }
 
 // ─── Scanner detection ────────────────────────────────────────────────────────
